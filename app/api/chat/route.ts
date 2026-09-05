@@ -1,49 +1,74 @@
-type IncomingMessage = {
-  role: 'user' | 'assistant';
-  content: string;
-};
+import {
+  buildDeepSeekRequest,
+  DEFAULT_SETTINGS,
+  isValidMessage,
+  MAX_MESSAGES,
+  MODEL,
+  settingsError,
+  type ResponseSettings,
+} from '../../../lib/chat-request';
 
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/chat/completions';
-const MODEL = 'deepseek-v4-flash';
-const MAX_MESSAGES = 30;
-const MAX_MESSAGE_LENGTH = 12000;
 
 export const dynamic = 'force-dynamic';
 
-function isValidMessage(value: unknown): value is IncomingMessage {
-  if (!value || typeof value !== 'object') return false;
-  const message = value as Record<string, unknown>;
-  return (
-    (message.role === 'user' || message.role === 'assistant') &&
-    typeof message.content === 'string' &&
-    message.content.trim().length > 0 &&
-    message.content.length <= MAX_MESSAGE_LENGTH
-  );
-}
-
 export async function POST(request: Request) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) {
-    return Response.json(
-      { error: 'На сервере не задана переменная DEEPSEEK_API_KEY.' },
-      { status: 503, headers: { 'Cache-Control': 'no-store' } },
-    );
-  }
+  const headers = { 'Cache-Control': 'no-store' };
 
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return Response.json({ error: 'Некорректный JSON в запросе.' }, { status: 400 });
+    return Response.json(
+      { error: 'Некорректный JSON в запросе.' },
+      { status: 400, headers },
+    );
   }
 
   const messages = (body as { messages?: unknown })?.messages;
-  if (!Array.isArray(messages) || messages.length === 0 || messages.length > MAX_MESSAGES) {
-    return Response.json({ error: `Передайте от 1 до ${MAX_MESSAGES} сообщений.` }, { status: 400 });
+  if (
+    !Array.isArray(messages) ||
+    messages.length === 0 ||
+    messages.length > MAX_MESSAGES
+  ) {
+    return Response.json(
+      { error: `Передайте от 1 до ${MAX_MESSAGES} сообщений.` },
+      { status: 400, headers },
+    );
   }
   if (!messages.every(isValidMessage) || messages.at(-1)?.role !== 'user') {
-    return Response.json({ error: 'История диалога имеет неверный формат.' }, { status: 400 });
+    return Response.json(
+      { error: 'История диалога имеет неверный формат.' },
+      { status: 400, headers },
+    );
   }
+
+  const settings = (body as { settings?: unknown }).settings;
+  const resolvedSettings = settings === undefined ? DEFAULT_SETTINGS : settings;
+  const invalidSettings = settingsError(resolvedSettings);
+  if (invalidSettings) {
+    return Response.json({ error: invalidSettings }, { status: 400, headers });
+  }
+
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  if (!apiKey) {
+    return Response.json(
+      {
+        error:
+          'На сервере не задана переменная DEEPSEEK_API_KEY. Запрос в DeepSeek не отправлен.',
+      },
+      { status: 503, headers },
+    );
+  }
+
+  // Return the very same body passed to fetch, including on upstream errors.
+  // Authorization is a separate server-only header and is never included here.
+  const requestJson = JSON.stringify(
+    buildDeepSeekRequest(messages, {
+      ...DEFAULT_SETTINGS,
+      ...(resolvedSettings as Partial<ResponseSettings>),
+    }),
+  );
 
   try {
     const upstream = await fetch(DEEPSEEK_API_URL, {
@@ -52,15 +77,7 @@ export async function POST(request: Request) {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [
-          { role: 'system', content: 'Ты полезный ассистент. Отвечай ясно и по существу на языке пользователя.' },
-          ...messages,
-        ],
-        stream: false,
-        max_tokens: 4096,
-      }),
+      body: requestJson,
       signal: AbortSignal.timeout(90000),
     });
 
@@ -71,25 +88,53 @@ export async function POST(request: Request) {
         429: 'DeepSeek временно ограничил частоту запросов. Попробуйте позже.',
       };
       return Response.json(
-        { error: errorByStatus[upstream.status] || `DeepSeek вернул ошибку ${upstream.status}.` },
-        { status: upstream.status >= 500 ? 502 : upstream.status, headers: { 'Cache-Control': 'no-store' } },
+        {
+          error:
+            errorByStatus[upstream.status] ||
+            `DeepSeek вернул ошибку ${upstream.status}.`,
+          requestJson,
+        },
+        { status: upstream.status >= 500 ? 502 : upstream.status, headers },
       );
     }
 
     const result = (await upstream.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{
+        message?: { content?: string };
+        finish_reason?: string;
+      }>;
     };
-    const message = result.choices?.[0]?.message?.content?.trim();
+    const choice = result.choices?.[0];
+    const message = choice?.message?.content?.trim();
+    const finishReason = choice?.finish_reason ?? null;
     if (!message) {
-      return Response.json({ error: 'DeepSeek вернул пустой ответ.' }, { status: 502 });
+      return Response.json(
+        {
+          error:
+            finishReason === 'length'
+              ? 'Лимит токенов исчерпан до появления ответа. Увеличьте лимит.'
+              : 'DeepSeek вернул пустой ответ. Проверьте лимит и стоп-строку.',
+          requestJson,
+          finishReason,
+        },
+        { status: 502, headers },
+      );
     }
 
-    return Response.json({ message, model: MODEL }, { headers: { 'Cache-Control': 'no-store' } });
+    return Response.json(
+      { message, model: MODEL, requestJson, finishReason },
+      { headers },
+    );
   } catch (error) {
     const timedOut = error instanceof Error && error.name === 'TimeoutError';
     return Response.json(
-      { error: timedOut ? 'DeepSeek не ответил вовремя.' : 'Не удалось связаться с DeepSeek.' },
-      { status: 502, headers: { 'Cache-Control': 'no-store' } },
+      {
+        error: timedOut
+          ? 'DeepSeek не ответил вовремя.'
+          : 'Не удалось связаться с DeepSeek.',
+        requestJson,
+      },
+      { status: 502, headers },
     );
   }
 }
