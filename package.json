@@ -9,7 +9,7 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "wrangler dev --config dist/server/wrangler.json",
-    "lint": "oxlint app components/response-settings.tsx lib/chat-request.ts",
+    "lint": "oxlint app hooks/use-chat.ts components/response-settings.tsx components/expert-panel.tsx components/request-metrics.tsx lib",
     "test": "node --test tests/*.test.mjs",
     "format": "oxfmt"
   },

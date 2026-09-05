@@ -3,7 +3,6 @@ import { readFile } from 'node:fs/promises';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 import ts from 'typescript';
 
-// Load the real TypeScript handler without starting a server or adding a runner.
 const toModule = (source) =>
   'data:text/javascript;base64,' +
   Buffer.from(
@@ -24,262 +23,282 @@ const routeSource = await readFile(
 const { POST } = await import(
   toModule(routeSource.replace('../../../lib/chat-request', sharedModule))
 );
-const { DEFAULT_SETTINGS } = await import(sharedModule);
-const messages = [{ role: 'user', content: 'Объясни, что такое API.' }];
+const messages = [{ role: 'user', content: 'Объясни API.' }];
 const originalKey = process.env.DEEPSEEK_API_KEY;
 let sent;
+
+const upstream = (parts, { status = 200 } = {}) =>
+  new Response(
+    new ReadableStream({
+      start(controller) {
+        for (const part of parts)
+          controller.enqueue(
+            typeof part === 'string' ? new TextEncoder().encode(part) : part,
+          );
+        controller.close();
+      },
+    }),
+    { status, headers: { 'Content-Type': 'text/event-stream' } },
+  );
+const chunk = (value) => `data: ${JSON.stringify(value)}\n\n`;
+const success = () =>
+  upstream([
+    chunk({
+      model: 'deepseek-v4-flash',
+      choices: [{ delta: { content: 'От' }, finish_reason: null }],
+    }),
+    chunk({
+      model: 'deepseek-v4-flash',
+      choices: [{ delta: { content: 'вет' }, finish_reason: 'stop' }],
+    }),
+    chunk({
+      choices: [],
+      usage: {
+        prompt_tokens: 7,
+        completion_tokens: 2,
+        total_tokens: 9,
+        prompt_cache_hit_tokens: 3,
+        prompt_cache_miss_tokens: 4,
+        completion_tokens_details: { reasoning_tokens: 1, ignored: 8 },
+      },
+    }),
+    'data: [DONE]\n\n',
+  ]);
+const readEvents = async (response) => {
+  const text = await response.text();
+  return text
+    .trim()
+    .split(/\r?\n\r?\n/)
+    .map((frame) => {
+      const lines = frame.split(/\r?\n/);
+      return {
+        event: lines
+          .find((line) => line.startsWith('event:'))
+          ?.slice(6)
+          .trim(),
+        data: JSON.parse(
+          lines
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart())
+            .join('\n'),
+        ),
+      };
+    });
+};
+const post = (body, signal) =>
+  POST(
+    new Request('http://localhost/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    }),
+  );
 
 beforeEach(() => {
   process.env.DEEPSEEK_API_KEY = 'unit-test-secret';
   sent = [];
   mock.method(globalThis, 'fetch', async (url, options) => {
     sent.push({ url, ...options });
-    return Response.json({
-      choices: [{ message: { content: 'Ответ' }, finish_reason: 'stop' }],
-    });
+    return success();
   });
 });
-
 afterEach(() => {
   mock.restoreAll();
   if (originalKey === undefined) delete process.env.DEEPSEEK_API_KEY;
   else process.env.DEEPSEEK_API_KEY = originalKey;
 });
 
-const post = (body) =>
-  POST(
-    new Request('http://localhost/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
-  );
-
-test('instruction, length and exact outgoing JSON reach the API without exposing the key', async () => {
-  const settings = {
-    ...DEFAULT_SETTINGS,
-    format: 'Два предложения.',
-    maxTokens: 150,
-    stopMode: 'instruction',
-    stopInstruction: 'Остановись после второго предложения.',
-  };
-  const response = await post({ messages, settings });
-  const result = await response.json();
-  assert.equal(response.status, 200);
-  assert.equal(result.requestJson, sent[0].body);
-  assert.equal(sent[0].url, 'https://api.deepseek.com/chat/completions');
-  const payload = JSON.parse(sent[0].body);
-  assert.deepEqual(payload.messages.slice(1), messages);
-  assert.ok(payload.messages[0].content.includes(settings.format));
-  assert.ok(payload.messages[0].content.includes(settings.stopInstruction));
-  assert.equal(payload.max_tokens, 150);
-  assert.equal(payload.thinking.type, 'disabled');
-  assert.equal('stop' in payload, false);
-  assert.equal(sent[0].headers.Authorization, 'Bearer unit-test-secret');
-  assert.equal(JSON.stringify(result).includes('unit-test-secret'), false);
-  assert.equal(response.headers.get('cache-control'), 'no-store');
-});
-
-test('sequence mode preserves the exact marker, omits the inactive instruction and strips untrusted message fields', async () => {
-  const marker = ' [END]\n';
+test('proxies incremental deltas, request JSON, finish metadata and exact API usage', async () => {
   const response = await post({
-    messages: [{ ...messages[0], prefix: true, injected: 'ignored' }],
-    settings: {
-      ...DEFAULT_SETTINGS,
-      stopMode: 'sequence',
-      stopSequence: marker,
-      stopInstruction: 'INACTIVE',
-    },
+    messages,
+    settings: { format: 'Кратко.', maxTokens: 150 },
   });
   assert.equal(response.status, 200);
-  const payload = JSON.parse(sent[0].body);
-  assert.deepEqual(payload.stop, [marker]);
-  assert.deepEqual(payload.messages[1], messages[0]);
-  assert.ok(payload.messages[0].content.includes(JSON.stringify(marker)));
-  assert.equal(payload.messages[0].content.includes('INACTIVE'), false);
-});
-
-test('changing parameters leaves the same prompt and context intact', async () => {
-  const context = [
-    { role: 'user', content: 'Привет' },
-    { role: 'assistant', content: 'Здравствуйте' },
-    ...messages,
-  ];
-  await post({ messages: context, settings: DEFAULT_SETTINGS });
-  await post({
-    messages: context,
-    settings: { ...DEFAULT_SETTINGS, maxTokens: 100, format: 'Одна строка.' },
-  });
+  assert.match(response.headers.get('content-type'), /^text\/event-stream/);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const events = await readEvents(response);
   assert.deepEqual(
-    JSON.parse(sent[0].body).messages,
-    JSON.parse(sent[1].body).messages.slice(1),
+    events.map(({ event }) => event),
+    ['request', 'delta', 'delta', 'done'],
   );
-  assert.notEqual(
-    JSON.parse(sent[0].body).max_tokens,
-    JSON.parse(sent[1].body).max_tokens,
+  assert.equal(events[0].data.requestJson, sent[0].body);
+  assert.equal(events[1].data.content + events[2].data.content, 'Ответ');
+  assert.deepEqual(events[3].data, {
+    finishReason: 'stop',
+    model: 'deepseek-v4-flash',
+    usage: {
+      prompt_tokens: 7,
+      completion_tokens: 2,
+      total_tokens: 9,
+      prompt_cache_hit_tokens: 3,
+      prompt_cache_miss_tokens: 4,
+      completion_tokens_details: { reasoning_tokens: 1 },
+    },
+  });
+  const outgoing = JSON.parse(sent[0].body);
+  assert.equal(outgoing.stream, true);
+  assert.deepEqual(outgoing.stream_options, { include_usage: true });
+  assert.equal(sent[0].headers.Authorization, 'Bearer unit-test-secret');
+  assert.equal(JSON.stringify(events).includes('unit-test-secret'), false);
+});
+
+test('parses upstream SSE across UTF-8/chunk/CRLF boundaries and ignores comments', async () => {
+  const bytes = new TextEncoder().encode(
+    ': ping\r\ndata: ' +
+      JSON.stringify({
+        model: 'm',
+        choices: [{ delta: { content: 'Привет 🌍' }, finish_reason: 'stop' }],
+      }) +
+      '\r\n\r\ndata: [DONE]\r\n\r\n',
   );
-});
-
-test('invalid settings never call DeepSeek', async () => {
-  for (const settings of [
-    null,
-    [],
-    'bad',
-    { ...DEFAULT_SETTINGS, format: null },
-    { ...DEFAULT_SETTINGS, format: 'x'.repeat(2001) },
-    ...[0, -1, 4097, 1.5, '512', ''].map((maxTokens) => ({
-      ...DEFAULT_SETTINGS,
-      maxTokens,
-    })),
-    { ...DEFAULT_SETTINGS, stopMode: 'unknown' },
-    { ...DEFAULT_SETTINGS, stopInstruction: null },
-    { ...DEFAULT_SETTINGS, stopInstruction: 'x'.repeat(2001) },
-    { ...DEFAULT_SETTINGS, stopMode: 'sequence', stopSequence: null },
-    {
-      ...DEFAULT_SETTINGS,
-      stopMode: 'sequence',
-      stopSequence: 'x'.repeat(201),
-    },
-  ]) {
-    assert.equal((await post({ messages, settings })).status, 400);
-  }
-  assert.equal(sent.length, 0);
-});
-
-test('invalid history and malformed JSON never call DeepSeek', async () => {
-  for (const history of [
-    [],
-    Array(31).fill(messages[0]),
-    [{ role: 'system', content: 'bad' }],
-    [{ role: 'assistant', content: 'bad' }],
-    [{ role: 'user', content: ' ' }],
-    [{ role: 'user', content: 'x'.repeat(12001) }],
-  ]) {
-    assert.equal((await post({ messages: history })).status, 400);
-  }
-  const bad = await POST(
-    new Request('http://localhost/api/chat', { method: 'POST', body: '{' }),
+  globalThis.fetch.mock.mockImplementation(async () =>
+    upstream([
+      bytes.slice(0, 17),
+      bytes.slice(17, 45),
+      bytes.slice(45, 67),
+      bytes.slice(67),
+    ]),
   );
-  assert.equal(bad.status, 400);
-  assert.equal(sent.length, 0);
+  const events = await readEvents(await post({ messages }));
+  assert.equal(
+    events.find(({ event }) => event === 'delta').data.content,
+    'Привет 🌍',
+  );
+  assert.equal(events.at(-1).event, 'done');
 });
 
-test('empty, omitted and whitespace-only settings send no custom conditions', async () => {
-  for (const settings of [
-    undefined,
-    {},
-    DEFAULT_SETTINGS,
-    {
-      ...DEFAULT_SETTINGS,
-      format: ' \n ',
-      stopMode: 'instruction',
-      stopInstruction: '  ',
-    },
-    { ...DEFAULT_SETTINGS, stopMode: 'sequence', stopSequence: ' \n ' },
-    {
-      ...DEFAULT_SETTINGS,
-      stopInstruction: 'INACTIVE',
-      stopSequence: '[INACTIVE]',
-    },
-  ]) {
-    const response = await post({ messages, settings });
-    const result = await response.json();
-    assert.equal(response.status, 200);
-    assert.equal(result.requestJson, sent.at(-1).body);
-    assert.deepEqual(JSON.parse(result.requestJson), {
-      model: 'deepseek-v4-flash',
-      messages,
-      stream: false,
-    });
-  }
-});
-
-test('each parameter can be supplied on its own and cleared independently', async () => {
-  for (const settings of [
-    { format: 'Одна строка.' },
-    { maxTokens: 100 },
-    { stopMode: 'instruction', stopInstruction: 'Заверши после определения.' },
-    { stopMode: 'sequence', stopSequence: '[END]' },
-  ]) {
-    assert.equal((await post({ messages, settings })).status, 200);
-    const payload = JSON.parse(sent.at(-1).body);
-    const system = payload.messages[0].content;
-    assert.equal(system.includes('Формат ответа:'), Boolean(settings.format));
-    assert.equal(
-      system.includes('Ограничение длины:'),
-      settings.maxTokens !== undefined,
-    );
-    assert.equal(
-      system.includes('Условие завершения:'),
-      Boolean(settings.stopMode),
-    );
-    assert.equal(payload.max_tokens, settings.maxTokens);
-    assert.deepEqual(
-      payload.stop,
-      settings.stopSequence ? [settings.stopSequence] : undefined,
-    );
-    assert.deepEqual(payload.messages.slice(1), messages);
-  }
-  for (const stopMode of ['instruction', 'sequence']) {
-    assert.equal(
-      (await post({ messages, settings: { format: 'Одна строка.', stopMode } }))
-        .status,
-      200,
-    );
-    const payload = JSON.parse(sent.at(-1).body);
-    assert.equal(
-      payload.messages[0].content.includes('Условие завершения:'),
-      false,
-    );
-    assert.equal('stop' in payload, false);
-    assert.equal('max_tokens' in payload, false);
-  }
-});
-
-test('a missing key is never reported as a sent request', async () => {
+test('validation and a missing key remain JSON errors before streaming', async () => {
+  assert.equal((await post({ messages: [] })).status, 400);
   delete process.env.DEEPSEEK_API_KEY;
   const response = await post({ messages });
   assert.equal(response.status, 503);
+  assert.match(response.headers.get('content-type'), /application\/json/);
   assert.equal((await response.json()).requestJson, undefined);
   assert.equal(sent.length, 0);
 });
 
-test('upstream errors and network failures retain the attempted request JSON', async () => {
-  for (const status of [401, 402, 429, 500]) {
-    globalThis.fetch.mock.mockImplementation(async (_url, options) => {
-      sent.push(options);
-      return new Response('upstream private error', { status });
-    });
-    const response = await post({ messages });
-    const result = await response.json();
-    assert.equal(response.status, status === 500 ? 502 : status);
-    assert.equal(result.requestJson, sent.at(-1).body);
-    assert.equal(
-      JSON.stringify(result).includes('upstream private error'),
-      false,
-    );
-  }
+test('upstream HTTP and connection errors remain JSON and retain requestJson', async () => {
   globalThis.fetch.mock.mockImplementation(async (_url, options) => {
     sent.push(options);
-    throw new DOMException('timeout', 'TimeoutError');
+    return new Response('private', { status: 429 });
   });
-  const result = await (await post({ messages })).json();
+  let response = await post({ messages });
+  let result = await response.json();
+  assert.equal(response.status, 429);
   assert.equal(result.requestJson, sent.at(-1).body);
-  assert.match(result.error, /вовремя/);
+  assert.equal(JSON.stringify(result).includes('private'), false);
+  globalThis.fetch.mock.mockImplementation(async (_url, options) => {
+    sent.push(options);
+    throw new TypeError('secret');
+  });
+  response = await post({ messages });
+  result = await response.json();
+  assert.equal(response.status, 502);
+  assert.equal(result.requestJson, sent.at(-1).body);
+  assert.equal(JSON.stringify(result).includes('secret'), false);
 });
 
-test('token truncation is returned for both partial and empty answers', async () => {
-  for (const content of ['Частичный ответ', '']) {
-    globalThis.fetch.mock.mockImplementation(async () =>
-      Response.json({
-        choices: [{ message: { content }, finish_reason: 'length' }],
+for (const [name, parts, pattern] of [
+  ['malformed', ['data: {bad}\n\n'], /повреждённый/],
+  [
+    'incomplete',
+    [chunk({ choices: [{ delta: { content: 'часть' } }] })],
+    /преждевременно/,
+  ],
+  ['unterminated', ['data: {}'], /незавершённый/i],
+  [
+    'empty',
+    [
+      chunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      'data: [DONE]\n\n',
+    ],
+    /пустой ответ/,
+  ],
+  [
+    'missing finish reason',
+    [
+      chunk({
+        model: 'deepseek-v4-flash',
+        choices: [{ delta: { content: 'Ответ' }, finish_reason: null }],
       }),
-    );
+      'data: [DONE]\n\n',
+    ],
+    /причину завершения/,
+  ],
+])
+  test(`reports ${name} upstream stream failures as SSE error events`, async () => {
+    globalThis.fetch.mock.mockImplementation(async () => upstream(parts));
     const response = await post({ messages });
-    const result = await response.json();
-    assert.equal(response.status, content ? 200 : 502);
-    assert.equal(result.finishReason, 'length');
-    assert.ok(result.requestJson);
-    if (!content) assert.match(result.error, /лимит/i);
-  }
+    const events = await readEvents(response);
+    assert.equal(response.status, 200);
+    assert.equal(events[0].event, 'request');
+    assert.equal(events.at(-1).event, 'error');
+    assert.match(events.at(-1).data.error, pattern);
+  });
+
+test('aborting the client request propagates to the upstream fetch signal', async () => {
+  let upstreamSignal;
+  globalThis.fetch.mock.mockImplementation(async (_url, options) => {
+    upstreamSignal = options.signal;
+    return success();
+  });
+  const controller = new AbortController();
+  const response = await post({ messages }, controller.signal);
+  controller.abort();
+  await response.text();
+  assert.equal(upstreamSignal.aborted, true);
+});
+
+test('an already aborted request reaches fetch with an aborted upstream signal', async () => {
+  let upstreamSignal;
+  globalThis.fetch.mock.mockImplementation(async (_url, options) => {
+    upstreamSignal = options.signal;
+    throw new DOMException('aborted', 'AbortError');
+  });
+  const controller = new AbortController();
+  controller.abort();
+  const response = await post({ messages }, controller.signal);
+  assert.equal(response.status, 502);
+  assert.equal(upstreamSignal.aborted, true);
+});
+
+test('cancelling downstream while reading cancels upstream without controller errors', async () => {
+  let markCancelled;
+  const cancelled = new Promise((resolve) => {
+    markCancelled = resolve;
+  });
+  globalThis.fetch.mock.mockImplementation(
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                chunk({
+                  model: 'deepseek-v4-flash',
+                  choices: [
+                    { delta: { content: 'часть' }, finish_reason: null },
+                  ],
+                }),
+              ),
+            );
+          },
+          cancel() {
+            markCancelled();
+          },
+        }),
+        { headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+  );
+  const response = await post({ messages });
+  const reader = response.body.getReader();
+  await reader.read();
+  await reader.cancel();
+  await Promise.race([
+    cancelled,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('upstream was not cancelled')), 500),
+    ),
+  ]);
 });

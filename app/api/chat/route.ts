@@ -3,25 +3,104 @@ import {
   DEFAULT_SETTINGS,
   isValidMessage,
   MAX_MESSAGES,
-  MODEL,
   settingsError,
   type ResponseSettings,
 } from '../../../lib/chat-request';
 
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/chat/completions';
-
+const TIMEOUT_MS = 90_000;
+const encoder = new TextEncoder();
 export const dynamic = 'force-dynamic';
 
-export async function POST(request: Request) {
-  const headers = { 'Cache-Control': 'no-store' };
+type Usage = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+  completion_tokens_details?: { reasoning_tokens?: number };
+};
 
+function event(name: string, value: unknown) {
+  return encoder.encode(`event: ${name}\ndata: ${JSON.stringify(value)}\n\n`);
+}
+
+function safeUsage(value: unknown): Usage | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const usage: Usage = {};
+  for (const key of [
+    'prompt_tokens',
+    'completion_tokens',
+    'total_tokens',
+    'prompt_cache_hit_tokens',
+    'prompt_cache_miss_tokens',
+  ] as const) {
+    if (typeof source[key] === 'number' && Number.isFinite(source[key]))
+      usage[key] = source[key];
+  }
+  const details = source.completion_tokens_details;
+  if (details && typeof details === 'object' && !Array.isArray(details)) {
+    const reasoning = (details as Record<string, unknown>).reasoning_tokens;
+    if (typeof reasoning === 'number' && Number.isFinite(reasoning)) {
+      usage.completion_tokens_details = { reasoning_tokens: reasoning };
+    }
+  }
+  return Object.keys(usage).length ? usage : null;
+}
+
+async function* sseData(body: ReadableStream<Uint8Array>, signal: AbortSignal) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let reachedEnd = false;
+  const cancelReader = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  if (signal.aborted) cancelReader();
+  else signal.addEventListener('abort', cancelReader, { once: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      let boundary = buffer.search(/\r\n\r\n|\n\n|\r\r/);
+      while (boundary !== -1) {
+        const separator =
+          buffer.slice(boundary).match(/^(?:\r\n\r\n|\n\n|\r\r)/)?.[0] ??
+          '\n\n';
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + separator.length);
+        const data = frame
+          .split(/\r\n|\r|\n/)
+          .filter((line) => !line.startsWith(':'))
+          .filter((line) => line === 'data' || line.startsWith('data:'))
+          .map((line) => line.slice(5).replace(/^ /, ''))
+          .join('\n');
+        if (data) yield data;
+        boundary = buffer.search(/\r\n\r\n|\n\n|\r\r/);
+      }
+      if (done) {
+        reachedEnd = true;
+        break;
+      }
+    }
+    if (buffer.trim()) throw new Error('Незавершённый SSE-кадр DeepSeek.');
+  } finally {
+    signal.removeEventListener('abort', cancelReader);
+    if (!reachedEnd) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
+export async function POST(request: Request) {
+  const jsonHeaders = { 'Cache-Control': 'no-store' };
   let body: unknown;
   try {
     body = await request.json();
   } catch {
     return Response.json(
       { error: 'Некорректный JSON в запросе.' },
-      { status: 400, headers },
+      { status: 400, headers: jsonHeaders },
     );
   }
 
@@ -33,100 +112,66 @@ export async function POST(request: Request) {
   ) {
     return Response.json(
       { error: `Передайте от 1 до ${MAX_MESSAGES} сообщений.` },
-      { status: 400, headers },
+      { status: 400, headers: jsonHeaders },
     );
   }
   if (!messages.every(isValidMessage) || messages.at(-1)?.role !== 'user') {
     return Response.json(
       { error: 'История диалога имеет неверный формат.' },
-      { status: 400, headers },
+      { status: 400, headers: jsonHeaders },
     );
   }
-
   const settings = (body as { settings?: unknown }).settings;
   const resolvedSettings = settings === undefined ? DEFAULT_SETTINGS : settings;
   const invalidSettings = settingsError(resolvedSettings);
-  if (invalidSettings) {
-    return Response.json({ error: invalidSettings }, { status: 400, headers });
-  }
-
+  if (invalidSettings)
+    return Response.json(
+      { error: invalidSettings },
+      { status: 400, headers: jsonHeaders },
+    );
   const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) {
+  if (!apiKey)
     return Response.json(
       {
         error:
           'На сервере не задана переменная DEEPSEEK_API_KEY. Запрос в DeepSeek не отправлен.',
       },
-      { status: 503, headers },
+      { status: 503, headers: jsonHeaders },
     );
-  }
 
-  // Return the very same body passed to fetch, including on upstream errors.
-  // Authorization is a separate server-only header and is never included here.
   const requestJson = JSON.stringify(
     buildDeepSeekRequest(messages, {
       ...DEFAULT_SETTINGS,
       ...(resolvedSettings as Partial<ResponseSettings>),
     }),
   );
+  const abortController = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    abortController.abort();
+  }, TIMEOUT_MS);
+  const disconnect = () => abortController.abort();
+  if (request.signal.aborted) abortController.abort();
+  else request.signal.addEventListener('abort', disconnect, { once: true });
+  const cleanup = () => {
+    clearTimeout(timeout);
+    request.signal.removeEventListener('abort', disconnect);
+  };
 
+  let upstream: Response;
   try {
-    const upstream = await fetch(DEEPSEEK_API_URL, {
+    upstream = await fetch(DEEPSEEK_API_URL, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: requestJson,
-      signal: AbortSignal.timeout(90000),
+      signal: abortController.signal,
     });
-
-    if (!upstream.ok) {
-      const errorByStatus: Record<number, string> = {
-        401: 'DeepSeek отклонил API-ключ. Проверьте переменную DEEPSEEK_API_KEY.',
-        402: 'На балансе DeepSeek недостаточно средств.',
-        429: 'DeepSeek временно ограничил частоту запросов. Попробуйте позже.',
-      };
-      return Response.json(
-        {
-          error:
-            errorByStatus[upstream.status] ||
-            `DeepSeek вернул ошибку ${upstream.status}.`,
-          requestJson,
-        },
-        { status: upstream.status >= 500 ? 502 : upstream.status, headers },
-      );
-    }
-
-    const result = (await upstream.json()) as {
-      choices?: Array<{
-        message?: { content?: string };
-        finish_reason?: string;
-      }>;
-    };
-    const choice = result.choices?.[0];
-    const message = choice?.message?.content?.trim();
-    const finishReason = choice?.finish_reason ?? null;
-    if (!message) {
-      return Response.json(
-        {
-          error:
-            finishReason === 'length'
-              ? 'Лимит токенов исчерпан до появления ответа. Увеличьте лимит.'
-              : 'DeepSeek вернул пустой ответ. Проверьте лимит и стоп-строку.',
-          requestJson,
-          finishReason,
-        },
-        { status: 502, headers },
-      );
-    }
-
-    return Response.json(
-      { message, model: MODEL, requestJson, finishReason },
-      { headers },
-    );
-  } catch (error) {
-    const timedOut = error instanceof Error && error.name === 'TimeoutError';
+  } catch {
+    cleanup();
     return Response.json(
       {
         error: timedOut
@@ -134,7 +179,133 @@ export async function POST(request: Request) {
           : 'Не удалось связаться с DeepSeek.',
         requestJson,
       },
-      { status: 502, headers },
+      { status: 502, headers: jsonHeaders },
     );
   }
+  if (!upstream.ok) {
+    cleanup();
+    void upstream.body?.cancel().catch(() => undefined);
+    const errors: Record<number, string> = {
+      401: 'DeepSeek отклонил API-ключ. Проверьте переменную DEEPSEEK_API_KEY.',
+      402: 'На балансе DeepSeek недостаточно средств.',
+      429: 'DeepSeek временно ограничил частоту запросов. Попробуйте позже.',
+    };
+    return Response.json(
+      {
+        error:
+          errors[upstream.status] ||
+          `DeepSeek вернул ошибку ${upstream.status}.`,
+        requestJson,
+      },
+      {
+        status: upstream.status >= 500 ? 502 : upstream.status,
+        headers: jsonHeaders,
+      },
+    );
+  }
+  if (!upstream.body) {
+    cleanup();
+    return Response.json(
+      { error: 'DeepSeek вернул пустой поток.', requestJson },
+      { status: 502, headers: jsonHeaders },
+    );
+  }
+
+  const upstreamBody = upstream.body;
+  let downstreamCancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const emit = (name: string, value: unknown) => {
+        if (downstreamCancelled) return false;
+        controller.enqueue(event(name, value));
+        return true;
+      };
+      emit('request', { requestJson });
+      let contentSeen = false,
+        doneSeen = false;
+      let finishReason: string | null = null,
+        usage: Usage | null = null,
+        model = '';
+      try {
+        for await (const data of sseData(
+          upstreamBody,
+          abortController.signal,
+        )) {
+          if (downstreamCancelled) return;
+          if (data === '[DONE]') {
+            doneSeen = true;
+            break;
+          }
+          let chunk: unknown;
+          try {
+            chunk = JSON.parse(data);
+          } catch {
+            throw new Error('DeepSeek вернул повреждённый поток данных.');
+          }
+          if (!chunk || typeof chunk !== 'object' || Array.isArray(chunk))
+            throw new Error('DeepSeek вернул повреждённый поток данных.');
+          const record = chunk as Record<string, unknown>;
+          if (record.error)
+            throw new Error('DeepSeek сообщил об ошибке в потоке.');
+          if (typeof record.model === 'string' && record.model)
+            model = record.model;
+          const nextUsage = safeUsage(record.usage);
+          if (nextUsage) usage = Object.assign(usage ?? {}, nextUsage);
+          const choice = Array.isArray(record.choices)
+            ? record.choices[0]
+            : null;
+          if (choice && typeof choice === 'object') {
+            const item = choice as Record<string, unknown>;
+            if (typeof item.finish_reason === 'string')
+              finishReason = item.finish_reason;
+            const delta = item.delta;
+            if (delta && typeof delta === 'object') {
+              const content = (delta as Record<string, unknown>).content;
+              if (typeof content === 'string' && content) {
+                contentSeen = true;
+                emit('delta', { content });
+              }
+            }
+          }
+        }
+        if (!doneSeen) throw new Error('DeepSeek преждевременно закрыл поток.');
+        if (!contentSeen)
+          throw new Error(
+            finishReason === 'length'
+              ? 'Лимит токенов исчерпан до появления ответа. Увеличьте лимит.'
+              : 'DeepSeek вернул пустой ответ. Проверьте лимит и стоп-строку.',
+          );
+        if (!finishReason)
+          throw new Error('DeepSeek не указал причину завершения ответа.');
+        if (!model) throw new Error('DeepSeek не указал модель в потоке.');
+        emit('done', { finishReason, usage, model });
+      } catch (error) {
+        if (!request.signal.aborted && !downstreamCancelled)
+          emit('error', {
+            error: timedOut
+              ? 'DeepSeek не ответил вовремя.'
+              : error instanceof Error
+                ? error.message
+                : 'Не удалось прочитать ответ DeepSeek.',
+          });
+      } finally {
+        cleanup();
+        if (!abortController.signal.aborted) abortController.abort();
+        if (!downstreamCancelled) controller.close();
+      }
+    },
+    cancel() {
+      downstreamCancelled = true;
+      abortController.abort();
+      cleanup();
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      'Cache-Control': 'no-store',
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+  });
 }

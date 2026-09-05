@@ -4,6 +4,7 @@ export type IncomingMessage = {
 };
 
 export type ResponseSettings = {
+  systemPrompt: string;
   format: string;
   maxTokens: number | null;
   stopMode: 'none' | 'instruction' | 'sequence';
@@ -14,8 +15,10 @@ export type ResponseSettings = {
 export const MODEL = 'deepseek-v4-flash';
 export const MAX_MESSAGES = 30;
 export const MAX_MESSAGE_LENGTH = 12000;
+export const MAX_SYSTEM_PROMPT_LENGTH = 8000;
 export const MAX_TOKENS = 4096;
 export const DEFAULT_SETTINGS: ResponseSettings = {
+  systemPrompt: '',
   format: '',
   maxTokens: null,
   stopMode: 'none',
@@ -28,6 +31,13 @@ export function settingsError(value: unknown): string | null {
     return 'Параметры ответа должны быть объектом.';
   }
   const settings = value as Record<string, unknown>;
+  if (
+    settings.systemPrompt !== undefined &&
+    (typeof settings.systemPrompt !== 'string' ||
+      settings.systemPrompt.length > MAX_SYSTEM_PROMPT_LENGTH)
+  ) {
+    return 'Системный промпт должен быть строкой до 8 000 символов или пустым.';
+  }
   if (
     settings.format !== undefined &&
     (typeof settings.format !== 'string' || settings.format.length > 2000)
@@ -100,24 +110,29 @@ export function buildDeepSeekRequest(
       : '',
     completion ? `Условие завершения: ${completion}` : '',
   ].filter(Boolean);
+  const systemPrompt = settings.systemPrompt.trim();
 
   return {
     model: MODEL,
     messages: [
-      ...(instructions.length
+      ...(systemPrompt || instructions.length
         ? [
             {
               role: 'system' as const,
               content: [
                 'Ты полезный ассистент. Отвечай ясно и по существу на языке пользователя.',
+                systemPrompt,
                 ...instructions,
-              ].join('\n\n'),
+              ]
+                .filter(Boolean)
+                .join('\n\n'),
             },
           ]
         : []),
       ...messages.map(({ role, content }) => ({ role, content })),
     ],
-    stream: false,
+    stream: true,
+    stream_options: { include_usage: true },
     // Small answer budgets should not be consumed by hidden reasoning.
     ...(settings.maxTokens !== null
       ? {

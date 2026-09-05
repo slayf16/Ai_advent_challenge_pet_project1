@@ -10,6 +10,7 @@ import {
 import { Textarea } from '@/components/ui/textarea';
 import {
   DEFAULT_SETTINGS,
+  MAX_SYSTEM_PROMPT_LENGTH,
   MAX_TOKENS,
   settingsError,
   type ResponseSettings,
@@ -61,6 +62,28 @@ export function ResponseSettingsPanel({
           disabled={isSending}
           className="mt-5 space-y-5 disabled:opacity-60"
         >
+          <div className="space-y-2">
+            <label
+              htmlFor="system-prompt"
+              className="block text-sm font-medium"
+            >
+              Системный промпт
+            </label>
+            <Textarea
+              id="system-prompt"
+              value={settings.systemPrompt}
+              maxLength={MAX_SYSTEM_PROMPT_LENGTH}
+              onChange={(event) =>
+                onChange({ ...settings, systemPrompt: event.target.value })
+              }
+              className="min-h-32 resize-y text-sm leading-6"
+              placeholder="Например: отвечай как опытный редактор технической документации…"
+            />
+            <p className="text-sm leading-5 text-muted-foreground">
+              Задаёт роль, контекст и общие правила для модели. До 8 000
+              символов.
+            </p>
+          </div>
           <div className="space-y-2">
             <label
               htmlFor="response-format"
@@ -226,7 +249,8 @@ export function ResponseSettingsPanel({
             JSON запроса к DeepSeek
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Тело последнего запроса, возвращённое сервером.
+            Тело последнего запроса. Появляется сразу после того, как сервер
+            принял запрос.
           </p>
         </div>
         {requestJson ? (
@@ -239,7 +263,7 @@ export function ResponseSettingsPanel({
         ) : (
           <output className="block p-5 text-sm leading-6 text-muted-foreground">
             {isSending
-              ? 'Запрос выполняется. JSON появится после ответа сервера.'
+              ? 'Запрос отправлен. JSON появится, как только сервер его примет.'
               : 'Отправьте сообщение. Здесь появятся системная инструкция, история и параметры, переданные API.'}
           </output>
         )}

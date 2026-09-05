@@ -25,6 +25,8 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+/.deepchat-server*.log
+*.tsbuildinfo
 
 # local environment
 .env*
