@@ -71,6 +71,8 @@ afterEach(() => mock.restoreAll());
 
 test('three experts start concurrently; synthesis waits for all and receives every full answer plus original data', async () => {
   const calls = setup();
+  const initial = render();
+  initial.setSettings({ ...initial.settings, temperature: 0.35 });
   const pending = render().send('Реши задачу', {
     council: true,
     topic: 'Алгоритмы',
@@ -78,6 +80,7 @@ test('three experts start concurrently; synthesis waits for all and receives eve
   });
   assert.equal(calls.length, 3);
   for (let i = 0; i < 3; i++) {
+    assert.equal(calls[i].body.settings.temperature, 0.35);
     assert.ok(
       calls[i].body.settings.systemPrompt.includes(EXPERT_ROLES[i].prompt),
     );
@@ -93,6 +96,7 @@ test('three experts start concurrently; synthesis waits for all and receives eve
   calls[2].resolve(response('Третий ответ'));
   await tick();
   assert.equal(calls.length, 4);
+  assert.equal(calls[3].body.settings.temperature, 0.35);
   const finalContext = calls[3].body.messages.map((m) => m.content).join('\n');
   for (const text of [
     'Реши задачу',
@@ -147,10 +151,11 @@ test('repeat uses the original context and new settings; ordinary follow-up uses
   calls[0].resolve(response('Вариант A'));
   await first;
   let chat = render();
-  chat.setSettings({ ...chat.settings, systemPrompt: 'Кратко' });
+  chat.setSettings({ ...chat.settings, systemPrompt: 'Кратко', temperature: 0 });
   const repeated = render().repeat();
   assert.deepEqual(calls[1].body.messages, calls[0].body.messages);
   assert.equal(calls[1].body.settings.systemPrompt, 'Кратко');
+  assert.equal(calls[1].body.settings.temperature, 0);
   calls[1].resolve(response('Вариант B'));
   await repeated;
   const followup = render().send('Объясни подробнее');

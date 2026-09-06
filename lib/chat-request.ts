@@ -7,6 +7,7 @@ export type ResponseSettings = {
   systemPrompt: string;
   format: string;
   maxTokens: number | null;
+  temperature: number | null;
   stopMode: 'none' | 'instruction' | 'sequence';
   stopInstruction: string;
   stopSequence: string;
@@ -21,6 +22,7 @@ export const DEFAULT_SETTINGS: ResponseSettings = {
   systemPrompt: '',
   format: '',
   maxTokens: null,
+  temperature: null,
   stopMode: 'none',
   stopInstruction: '',
   stopSequence: '',
@@ -52,6 +54,16 @@ export function settingsError(value: unknown): string | null {
       (settings.maxTokens as number) > MAX_TOKENS)
   ) {
     return `Укажите целое число от 1 до ${MAX_TOKENS} токенов или оставьте лимит пустым.`;
+  }
+  if (
+    settings.temperature !== undefined &&
+    settings.temperature !== null &&
+    (typeof settings.temperature !== 'number' ||
+      !Number.isFinite(settings.temperature) ||
+      settings.temperature < 0 ||
+      settings.temperature > 2)
+  ) {
+    return 'Укажите температуру от 0 до 2 или оставьте поле пустым.';
   }
   if (
     settings.stopMode !== undefined &&
@@ -133,12 +145,13 @@ export function buildDeepSeekRequest(
     ],
     stream: true,
     stream_options: { include_usage: true },
-    // Small answer budgets should not be consumed by hidden reasoning.
-    ...(settings.maxTokens !== null
-      ? {
-          thinking: { type: 'disabled' as const },
-          max_tokens: settings.maxTokens,
-        }
+    // Thinking mode ignores temperature and can consume small answer budgets.
+    ...(settings.maxTokens !== null || settings.temperature != null
+      ? { thinking: { type: 'disabled' as const } }
+      : {}),
+    ...(settings.maxTokens !== null ? { max_tokens: settings.maxTokens } : {}),
+    ...(settings.temperature != null
+      ? { temperature: settings.temperature }
       : {}),
     ...(stopSequence ? { stop: [stopSequence] } : {}),
   };

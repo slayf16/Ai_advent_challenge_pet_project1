@@ -109,6 +109,32 @@ afterEach(() => {
   else process.env.DEEPSEEK_API_KEY = originalKey;
 });
 
+test('temperature reaches upstream and request snapshot, including zero; empty values are omitted', async () => {
+  for (const temperature of [0, 0.7, 2, null, undefined]) {
+    const response = await post({ messages, settings: { temperature } });
+    assert.equal(response.status, 200);
+    const events = await readEvents(response);
+    const outgoing = JSON.parse(sent.at(-1).body);
+    assert.equal(events[0].data.requestJson, sent.at(-1).body);
+    if (temperature == null) {
+      assert.equal('temperature' in outgoing, false);
+      assert.equal('thinking' in outgoing, false);
+    } else {
+      assert.equal(outgoing.temperature, temperature);
+      assert.deepEqual(outgoing.thinking, { type: 'disabled' });
+    }
+  }
+});
+
+test('invalid temperature is rejected before upstream', async () => {
+  for (const temperature of [-0.1, 2.1, '0.7', false]) {
+    const response = await post({ messages, settings: { temperature } });
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /температуру/);
+  }
+  assert.equal(sent.length, 0);
+});
+
 test('proxies incremental deltas, request JSON, finish metadata and exact API usage', async () => {
   const response = await post({
     messages,

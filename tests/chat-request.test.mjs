@@ -26,6 +26,28 @@ const {
 
 const messages = [{ role: 'user', content: 'Проверь текст.' }];
 
+test('temperature accepts optional values and finite numbers from 0 to 2', () => {
+  for (const temperature of [undefined, null, 0, 0.25, 1, 2]) {
+    assert.equal(settingsError({ temperature }), null);
+  }
+  for (const temperature of [-0.1, 2.1, NaN, Infinity, -Infinity, '1', false, {}]) {
+    assert.match(settingsError({ temperature }), /температуру/);
+  }
+});
+
+test('explicit temperature including zero is sent and disables thinking without adding a token limit', () => {
+  for (const temperature of [0, 0.25, 2]) {
+    const request = buildDeepSeekRequest(messages, { ...DEFAULT_SETTINGS, temperature });
+    assert.equal(request.temperature, temperature);
+    assert.deepEqual(request.thinking, { type: 'disabled' });
+    assert.equal('max_tokens' in request, false);
+    assert.deepEqual(request.messages, messages);
+  }
+  const request = buildDeepSeekRequest(messages, { ...DEFAULT_SETTINGS, temperature: 0.7, maxTokens: 120 });
+  assert.equal(request.temperature, 0.7);
+  assert.equal(request.max_tokens, 120);
+});
+
 test('system prompt validation accepts 8,000 characters and rejects longer values', () => {
   assert.equal(
     settingsError({

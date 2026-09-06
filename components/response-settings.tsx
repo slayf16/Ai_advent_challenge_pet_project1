@@ -139,6 +139,37 @@ export function ResponseSettingsPanel({
             </p>
           </div>
           <div className="space-y-2">
+            <label htmlFor="temperature" className="block text-sm font-medium">
+              Температура
+            </label>
+            <Input
+              id="temperature"
+              type="number"
+              min={0}
+              max={2}
+              step="any"
+              value={Number.isNaN(settings.temperature) ? '' : (settings.temperature ?? '')}
+              placeholder="По умолчанию DeepSeek"
+              aria-describedby="temperature-hint"
+              onChange={(event) =>
+                onChange({
+                  ...settings,
+                  temperature:
+                    event.target.value === '' && !event.target.validity.badInput
+                      ? null
+                      : event.target.valueAsNumber,
+                })
+              }
+              className="h-10"
+            />
+            <p id="temperature-hint" className="text-sm leading-5 text-muted-foreground">
+              От 0 до 2: ниже — более предсказуемые ответы, выше — более
+              разнообразные. Пусто — настройка DeepSeek по умолчанию.
+              При заданной температуре режим рассуждений отключается,
+              чтобы модель учитывала её значение.
+            </p>
+          </div>
+          <div className="space-y-2">
             <label htmlFor="stop-mode" className="block text-sm font-medium">
               Условие завершения
             </label>
