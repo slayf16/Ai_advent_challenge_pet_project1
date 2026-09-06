@@ -30,7 +30,7 @@ import {
   RequestMetricsView,
 } from '@/components/request-metrics';
 import { useChat } from '@/hooks/use-chat';
-import { settingsError } from '@/lib/chat-request';
+import { MODELS, settingsError } from '@/lib/chat-request';
 import { EXPERT_ROLES, SYNTHESIS_PROMPT } from '@/lib/experts';
 
 type ModelContext = {
@@ -95,7 +95,7 @@ export default function Home() {
       context.registerTool(
         {
           name: 'send_deepseek_message',
-          title: 'Отправить сообщение в DeepSeek',
+          title: 'Отправить сообщение выбранной модели',
           description:
             'Отправляет сообщение в текущий диалог. По явному запросу пользователя council=true запускает трёх экспертов по указанной topic, затем показывает общий вывод.',
           inputSchema: {
@@ -183,7 +183,7 @@ export default function Home() {
             </div>
             <div>
               <p className="font-semibold tracking-tight">DeepChat</p>
-              <p className="text-xs text-muted-foreground">DeepSeek V4 Flash</p>
+              <p className="text-xs text-muted-foreground">{MODELS.find((model) => model.id === chat.settings.model)?.name}</p>
             </div>
           </div>
           <Button
@@ -204,7 +204,7 @@ export default function Home() {
         <div className="grid flex-1 grid-cols-1 gap-6 py-6 lg:grid-cols-[minmax(0,1fr)_340px] lg:gap-6">
           <section
             className="flex min-w-0 flex-col"
-            aria-label="Диалог с DeepSeek"
+            aria-label="Диалог с моделью"
           >
             <section
               className="rounded-2xl border border-primary/20 bg-primary/5 p-4 sm:p-5"
@@ -476,7 +476,7 @@ export default function Home() {
                   </div>
                 </div>
                 <p className="mt-3 text-center text-xs text-muted-foreground">
-                  DeepSeek может ошибаться — проверяйте важную информацию.
+                  Модель может ошибаться — проверяйте важную информацию.
                 </p>
               </form>
             </div>

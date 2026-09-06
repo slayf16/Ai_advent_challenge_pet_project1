@@ -4,6 +4,7 @@ export type IncomingMessage = {
 };
 
 export type ResponseSettings = {
+  model: ChatModel;
   systemPrompt: string;
   format: string;
   maxTokens: number | null;
@@ -14,11 +15,35 @@ export type ResponseSettings = {
 };
 
 export const MODEL = 'deepseek-v4-flash';
+export const FREE_MODEL = 'liquid/lfm-2.5-2.6b:free';
+export const MODELS = [
+  {
+    id: FREE_MODEL,
+    name: 'Liquid LFM 2.5 2.6B',
+    label: 'Маленькая · бесплатная',
+    description:
+      'Облачная модель через OpenRouter для сравнения с DeepSeek. Бесплатные запросы ограничены по частоте и доступности.',
+  },
+  {
+    id: MODEL,
+    name: 'DeepSeek V4 Flash',
+    label: 'Слабее · дешевле',
+    description: 'Для повседневных вопросов и простых задач.',
+  },
+  {
+    id: 'deepseek-v4-pro',
+    name: 'DeepSeek V4 Pro',
+    label: 'Сильнее · дороже',
+    description: 'Для сложных задач, анализа и программирования.',
+  },
+] as const;
+export type ChatModel = (typeof MODELS)[number]['id'];
 export const MAX_MESSAGES = 30;
 export const MAX_MESSAGE_LENGTH = 12000;
 export const MAX_SYSTEM_PROMPT_LENGTH = 8000;
 export const MAX_TOKENS = 4096;
 export const DEFAULT_SETTINGS: ResponseSettings = {
+  model: MODEL,
   systemPrompt: '',
   format: '',
   maxTokens: null,
@@ -33,6 +58,12 @@ export function settingsError(value: unknown): string | null {
     return 'Параметры ответа должны быть объектом.';
   }
   const settings = value as Record<string, unknown>;
+  if (
+    settings.model !== undefined &&
+    !MODELS.some((model) => model.id === settings.model)
+  ) {
+    return 'Выберите поддерживаемую модель.';
+  }
   if (
     settings.systemPrompt !== undefined &&
     (typeof settings.systemPrompt !== 'string' ||
@@ -101,7 +132,7 @@ export function isValidMessage(value: unknown): value is IncomingMessage {
   );
 }
 
-export function buildDeepSeekRequest(
+export function buildChatRequest(
   messages: IncomingMessage[],
   settings: ResponseSettings,
 ) {
@@ -125,7 +156,7 @@ export function buildDeepSeekRequest(
   const systemPrompt = settings.systemPrompt.trim();
 
   return {
-    model: MODEL,
+    model: settings.model ?? MODEL,
     messages: [
       ...(systemPrompt || instructions.length
         ? [
@@ -146,7 +177,8 @@ export function buildDeepSeekRequest(
     stream: true,
     stream_options: { include_usage: true },
     // Thinking mode ignores temperature and can consume small answer budgets.
-    ...(settings.maxTokens !== null || settings.temperature != null
+    ...(settings.model !== FREE_MODEL &&
+    (settings.maxTokens !== null || settings.temperature != null)
       ? { thinking: { type: 'disabled' as const } }
       : {}),
     ...(settings.maxTokens !== null ? { max_tokens: settings.maxTokens } : {}),
@@ -156,3 +188,6 @@ export function buildDeepSeekRequest(
     ...(stopSequence ? { stop: [stopSequence] } : {}),
   };
 }
+
+// Backward-compatible name for existing callers.
+export const buildDeepSeekRequest = buildChatRequest;

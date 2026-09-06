@@ -39,3 +39,6 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# Local agent handoff and Git authorization helper
+/.local-agent/

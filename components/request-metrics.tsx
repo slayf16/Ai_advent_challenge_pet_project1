@@ -1,9 +1,10 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { MODELS } from '@/lib/chat-request';
 import {
   aggregateMetrics,
-  DEEPSEEK_V4_FLASH_PRICING,
+  pricingForModel,
   metricsSnapshot,
   type CostEstimate,
   type RequestMetrics,
@@ -64,6 +65,7 @@ export function RequestMetricsView({
   const clock = useClock(metrics.status === 'running');
   const snapshot = metricsSnapshot(metrics, clock.performanceMs, clock.epochMs);
   const usage = metrics.usage;
+  const pricing = pricingForModel(metrics.model);
   const isTerminal = metrics.status !== 'running';
 
   return (
@@ -79,6 +81,13 @@ export function RequestMetricsView({
       </div>
 
       <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
+        <Metric
+          label="Модель"
+          value={
+            MODELS.find((model) => model.id === pricing.model)?.name ??
+            pricing.model
+          }
+        />
         <Metric label="Время" value={formatDuration(snapshot.durationMs)} />
         <Metric
           label="До первого токена"
@@ -161,29 +170,36 @@ export function RequestMetricsView({
             </dl>
             {snapshot.cost && (
               <div className="space-y-1 border-t border-white/8 pt-3 text-xs leading-5">
-                <p>
-                  Тариф:{' '}
-                  {snapshot.cost.tier === 'peak' ? 'пиковый' : 'внепиковый'}.
-                  Cache hit × $
-                  {
-                    DEEPSEEK_V4_FLASH_PRICING[
-                      snapshot.cost.tier === 'peak' ? 'peak' : 'offPeak'
-                    ].cacheHitInput
-                  }
-                  /1M + cache miss × $
-                  {
-                    DEEPSEEK_V4_FLASH_PRICING[
-                      snapshot.cost.tier === 'peak' ? 'peak' : 'offPeak'
-                    ].cacheMissInput
-                  }
-                  /1M + output × $
-                  {
-                    DEEPSEEK_V4_FLASH_PRICING[
-                      snapshot.cost.tier === 'peak' ? 'peak' : 'offPeak'
-                    ].output
-                  }
-                  /1M.
-                </p>
+                {pricing.model === 'liquid/lfm-2.5-2.6b:free' ? (
+                  <p>
+                    Бесплатная модель OpenRouter: $0 за входные и выходные
+                    токены. Действуют лимиты запросов.
+                  </p>
+                ) : (
+                  <p>
+                    Тариф:{' '}
+                    {snapshot.cost.tier === 'peak' ? 'пиковый' : 'внепиковый'}.
+                    Cache hit × $
+                    {
+                      pricing[
+                        snapshot.cost.tier === 'peak' ? 'peak' : 'offPeak'
+                      ].cacheHitInput
+                    }
+                    /1M + cache miss × $
+                    {
+                      pricing[
+                        snapshot.cost.tier === 'peak' ? 'peak' : 'offPeak'
+                      ].cacheMissInput
+                    }
+                    /1M + output × $
+                    {
+                      pricing[
+                        snapshot.cost.tier === 'peak' ? 'peak' : 'offPeak'
+                      ].output
+                    }
+                    /1M.
+                  </p>
+                )}
                 {!snapshot.cost.exact && (
                   <p>
                     API не передал cache hit/miss, поэтому показан диапазон от
@@ -191,14 +207,14 @@ export function RequestMetricsView({
                   </p>
                 )}
                 <p>
-                  Тариф проверен {DEEPSEEK_V4_FLASH_PRICING.verifiedAt}.{' '}
+                  Тариф проверен {pricing.verifiedAt}.{' '}
                   <a
                     className="text-primary underline underline-offset-2"
-                    href={DEEPSEEK_V4_FLASH_PRICING.sourceUrl}
+                    href={pricing.sourceUrl}
                     target="_blank"
                     rel="noreferrer"
                   >
-                    Официальные цены DeepSeek
+                    Тариф модели
                   </a>
                 </p>
               </div>

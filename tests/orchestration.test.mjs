@@ -72,7 +72,7 @@ afterEach(() => mock.restoreAll());
 test('three experts start concurrently; synthesis waits for all and receives every full answer plus original data', async () => {
   const calls = setup();
   const initial = render();
-  initial.setSettings({ ...initial.settings, temperature: 0.35 });
+  initial.setSettings({ ...initial.settings, temperature: 0.35, model: 'deepseek-v4-pro' });
   const pending = render().send('Реши задачу', {
     council: true,
     topic: 'Алгоритмы',
@@ -81,6 +81,7 @@ test('three experts start concurrently; synthesis waits for all and receives eve
   assert.equal(calls.length, 3);
   for (let i = 0; i < 3; i++) {
     assert.equal(calls[i].body.settings.temperature, 0.35);
+    assert.equal(calls[i].body.settings.model, 'deepseek-v4-pro');
     assert.ok(
       calls[i].body.settings.systemPrompt.includes(EXPERT_ROLES[i].prompt),
     );
@@ -97,6 +98,7 @@ test('three experts start concurrently; synthesis waits for all and receives eve
   await tick();
   assert.equal(calls.length, 4);
   assert.equal(calls[3].body.settings.temperature, 0.35);
+  assert.equal(calls[3].body.settings.model, 'deepseek-v4-pro');
   const finalContext = calls[3].body.messages.map((m) => m.content).join('\n');
   for (const text of [
     'Реши задачу',
@@ -151,17 +153,24 @@ test('repeat uses the original context and new settings; ordinary follow-up uses
   calls[0].resolve(response('Вариант A'));
   await first;
   let chat = render();
-  chat.setSettings({ ...chat.settings, systemPrompt: 'Кратко', temperature: 0 });
+  chat.setSettings({ ...chat.settings, systemPrompt: 'Кратко', temperature: 0, model: 'deepseek-v4-pro' });
   const repeated = render().repeat();
   assert.deepEqual(calls[1].body.messages, calls[0].body.messages);
   assert.equal(calls[1].body.settings.systemPrompt, 'Кратко');
   assert.equal(calls[1].body.settings.temperature, 0);
   calls[1].resolve(response('Вариант B'));
   await repeated;
+  assert.equal(calls[1].body.settings.model, 'deepseek-v4-pro');
+  const answers = render().messages.filter((message) => message.role === 'assistant');
+  assert.equal(answers[0].metrics.model, 'deepseek-v4-flash');
+  assert.equal(answers[1].metrics.model, 'deepseek-v4-pro');
+
   const followup = render().send('Объясни подробнее');
   assert.ok(calls[2].body.messages.some((m) => m.content === 'Вариант B'));
   calls[2].resolve(response('Пояснение'));
   await followup;
+  render().reset();
+  assert.equal(render().settings.model, 'deepseek-v4-pro');
 });
 
 test('failed partial output remains visible but is excluded from future ordinary context', async () => {
@@ -225,4 +234,30 @@ test('an ordinary follow-up remains valid after a long generated answer', async 
   );
   calls[1].resolve(response('Продолжение'));
   await next;
+});
+
+test('Liquid is used for every expert and synthesis; repeat can switch to DeepSeek', async () => {
+  const calls = setup();
+  const chat = render();
+  chat.setSettings({ ...chat.settings, model: 'liquid/lfm-2.5-2.6b:free' });
+  const pending = render().send('Задача', { council: true, topic: 'Логика' });
+  for (let i = 0; i < 3; i++) {
+    assert.equal(calls[i].body.settings.model, 'liquid/lfm-2.5-2.6b:free');
+    calls[i].resolve(response('Ответ эксперта'));
+  }
+  await tick();
+  assert.equal(calls[3].body.settings.model, 'liquid/lfm-2.5-2.6b:free');
+  calls[3].resolve(response('Итог'));
+  await pending;
+  assert.ok(render().runs[0].experts.every((expert) => expert.metrics.model === 'liquid/lfm-2.5-2.6b:free'));
+  render().setSettings({ ...render().settings, model: 'deepseek-v4-flash' });
+  const repeated = render().repeat();
+  for (let i = 4; i < 7; i++) {
+    assert.equal(calls[i].body.settings.model, 'deepseek-v4-flash');
+    calls[i].resolve(response('Новый ответ'));
+  }
+  await tick();
+  assert.equal(calls[7].body.settings.model, 'deepseek-v4-flash');
+  calls[7].resolve(response('Новый итог'));
+  await repeated;
 });

@@ -1,6 +1,8 @@
+import type { ChatModel } from './chat-request';
 import type { TokenUsage } from './chat-stream';
 
 export type RequestMetrics = {
+  model?: ChatModel;
   startedAt: number;
   firstTokenAt: number | null;
   endedAt: number | null;
@@ -14,11 +16,31 @@ export const DEEPSEEK_V4_FLASH_PRICING = {
   model: 'deepseek-v4-flash',
   currency: 'USD',
   unitTokens: 1_000_000,
-  verifiedAt: '2026-09-05',
+  verifiedAt: '2026-09-06',
   sourceUrl: 'https://api-docs.deepseek.com/quick_start/pricing',
   offPeak: { cacheHitInput: 0.007, cacheMissInput: 0.22, output: 0.66 },
   peak: { cacheHitInput: 0.014, cacheMissInput: 0.44, output: 1.32 },
 } as const;
+
+export const DEEPSEEK_V4_PRO_PRICING = {
+  ...DEEPSEEK_V4_FLASH_PRICING,
+  model: 'deepseek-v4-pro',
+  offPeak: { cacheHitInput: 0.022, cacheMissInput: 0.66, output: 1.98 },
+  peak: { cacheHitInput: 0.044, cacheMissInput: 1.32, output: 3.96 },
+} as const;
+export const LIQUID_FREE_PRICING = {
+  ...DEEPSEEK_V4_FLASH_PRICING,
+  model: 'liquid/lfm-2.5-2.6b:free',
+  sourceUrl: 'https://openrouter.ai/liquid/lfm-2.5-2.6b:free',
+  offPeak: { cacheHitInput: 0, cacheMissInput: 0, output: 0 },
+  peak: { cacheHitInput: 0, cacheMissInput: 0, output: 0 },
+} as const;
+export const pricingForModel = (model?: ChatModel) =>
+  model === 'liquid/lfm-2.5-2.6b:free'
+    ? LIQUID_FREE_PRICING
+    : model === 'deepseek-v4-pro'
+      ? DEEPSEEK_V4_PRO_PRICING
+      : DEEPSEEK_V4_FLASH_PRICING;
 
 export type CostEstimate = {
   exact: boolean;
@@ -76,6 +98,7 @@ export function requestEpochMs(
 
 export function pricingTierAt(epochMs: number): PricingTier {
   const date = new Date(epochMs);
+  if (date.getUTCDay() === 0 || date.getUTCDay() === 6) return 'off-peak';
   const minutes = date.getUTCHours() * 60 + date.getUTCMinutes();
   const isPeak =
     (minutes >= 60 && minutes < 240) || (minutes >= 360 && minutes < 600);
@@ -101,12 +124,24 @@ function cacheBreakdown(usage: TokenUsage) {
 export function calculateCost(
   usage: TokenUsage | null,
   tier: PricingTier,
+  model?: ChatModel,
 ): CostEstimate | null {
   if (!hasCoreUsage(usage)) return null;
-  const rates = DEEPSEEK_V4_FLASH_PRICING[tier === 'peak' ? 'peak' : 'offPeak'];
+  const rates = pricingForModel(model)[tier === 'peak' ? 'peak' : 'offPeak'];
   const unit = DEEPSEEK_V4_FLASH_PRICING.unitTokens;
   const outputUsd =
     (nonNegative(usage.completion_tokens) * rates.output) / unit;
+  if (model === 'liquid/lfm-2.5-2.6b:free') {
+    return {
+      exact: true,
+      minimumUsd: 0,
+      maximumUsd: 0,
+      cacheHitInputUsd: 0,
+      cacheMissInputUsd: 0,
+      outputUsd: 0,
+      tier: 'off-peak',
+    };
+  }
   const cache = cacheBreakdown(usage);
 
   if (!cache) {
@@ -159,7 +194,7 @@ export function metricsSnapshot(
     durationMs,
     ttftMs,
     averageTokensPerSecond,
-    cost: calculateCost(metrics.usage, tier),
+    cost: calculateCost(metrics.usage, tier, metrics.model),
   };
 }
 

@@ -47,7 +47,8 @@ type RequestSnapshot = {
   dataset: string;
 };
 const makeId = () => crypto.randomUUID();
-const newMetrics = (): RequestMetrics => ({
+const newMetrics = (model: ResponseSettings['model']): RequestMetrics => ({
+  model,
   startedAt: performance.now(),
   firstTokenAt: null,
   endedAt: null,
@@ -140,7 +141,7 @@ export function useChat() {
       const runMain = async (history: IncomingMessage[]) => {
         const id = makeId();
         let content = '';
-        let metrics = newMetrics();
+        let metrics = newMetrics(settings.model);
         const patch = (changes: Partial<ChatMessage>) =>
           setMessages((current) =>
             current.map((item) =>
@@ -198,7 +199,7 @@ export function useChat() {
 
       try {
         if (!snapshot.council) {
-          setPhase('DeepSeek отвечает');
+          setPhase('Модель отвечает');
           return await runMain(requestHistory);
         }
         setPhase('Три эксперта отвечают параллельно');
@@ -207,7 +208,7 @@ export function useChat() {
           content: '',
           status: 'running',
           requestJson: null,
-          metrics: newMetrics(),
+          metrics: newMetrics(settings.model),
         }));
         setRuns((current) => [
           ...current,
@@ -234,7 +235,7 @@ export function useChat() {
         const settled = await collectExperts(
           async (role): Promise<ExpertAnswer> => {
             let content = '';
-            let metrics = newMetrics();
+            let metrics = newMetrics(settings.model);
             updateExpert(role.id, { metrics });
             try {
               const result = await streamChat(

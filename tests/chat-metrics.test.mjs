@@ -36,11 +36,11 @@ test('official V4 Flash rates and UTC peak windows are represented exactly', () 
     cacheMissInput: 0.44,
     output: 1.32,
   });
-  assert.equal(pricingTierAt(Date.UTC(2026, 8, 5, 0, 59)), 'off-peak');
-  assert.equal(pricingTierAt(Date.UTC(2026, 8, 5, 1, 0)), 'peak');
-  assert.equal(pricingTierAt(Date.UTC(2026, 8, 5, 4, 0)), 'off-peak');
-  assert.equal(pricingTierAt(Date.UTC(2026, 8, 5, 6, 0)), 'peak');
-  assert.equal(pricingTierAt(Date.UTC(2026, 8, 5, 10, 0)), 'off-peak');
+  assert.equal(pricingTierAt(Date.UTC(2026, 8, 4, 0, 59)), 'off-peak');
+  assert.equal(pricingTierAt(Date.UTC(2026, 8, 4, 1, 0)), 'peak');
+  assert.equal(pricingTierAt(Date.UTC(2026, 8, 4, 4, 0)), 'off-peak');
+  assert.equal(pricingTierAt(Date.UTC(2026, 8, 4, 6, 0)), 'peak');
+  assert.equal(pricingTierAt(Date.UTC(2026, 8, 4, 10, 0)), 'off-peak');
 });
 
 test('cost uses cache hit, cache miss and output token prices', () => {
@@ -109,7 +109,7 @@ test('speed uses full request duration while TTFT remains a separate metric', ()
       },
     },
     5000,
-    Date.UTC(2026, 8, 5, 12),
+    Date.UTC(2026, 8, 4, 12),
   );
   assert.equal(snapshot.durationMs, 4000);
   assert.equal(snapshot.ttftMs, 1000);
@@ -141,7 +141,7 @@ test('aggregate uses wall time and marks totals partial when any usage is missin
       },
     ],
     700,
-    Date.UTC(2026, 8, 5, 12),
+    Date.UTC(2026, 8, 4, 12),
   );
   assert.equal(result.wallTimeMs, 600);
   assert.equal(result.usage.total_tokens, 15);
@@ -164,11 +164,40 @@ test('an aggregate with terminal requests but no usage remains explicitly unknow
       },
     ],
     500,
-    Date.UTC(2026, 8, 5, 12),
+    Date.UTC(2026, 8, 4, 12),
   );
   assert.equal(result.wallTimeMs, 200);
   assert.equal(result.usage, null);
   assert.equal(result.minimumCostUsd, null);
   assert.equal(result.maximumCostUsd, null);
   assert.equal(result.isPartial, true);
+});
+
+test('weekends remain off-peak and Pro uses its own tariff in mixed history', () => {
+  assert.equal(pricingTierAt(Date.UTC(2026, 8, 5, 1)), 'off-peak');
+  assert.equal(pricingTierAt(Date.UTC(2026, 8, 6, 6)), 'off-peak');
+  const usage = { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200,
+    prompt_cache_hit_tokens: 400, prompt_cache_miss_tokens: 600 };
+  const pro = calculateCost(usage, 'off-peak', 'deepseek-v4-pro');
+  assert.ok(Math.abs(pro.minimumUsd - 0.0008008) < 1e-12);
+  assert.equal(calculateCost(usage, 'peak', 'deepseek-v4-pro').minimumUsd, pro.minimumUsd * 2);
+  const metrics = { startedAt: 0, endedAt: 100, firstTokenAt: 10, status: 'complete', usage };
+  const result = aggregateMetrics([
+    { ...metrics, model: 'deepseek-v4-flash' }, { ...metrics, model: 'deepseek-v4-pro' },
+  ], 100, Date.UTC(2026, 8, 6, 12));
+  assert.ok(Math.abs(result.minimumCostUsd - (0.0002668 + 0.0008008)) < 1e-12);
+});
+
+test('free Liquid is exactly zero without cache counters and mixed totals keep paid costs', () => {
+  const usage = { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200 };
+  const cost = calculateCost(usage, 'peak', 'liquid/lfm-2.5-2.6b:free');
+  assert.equal(cost.exact, true);
+  assert.equal(cost.minimumUsd, 0);
+  assert.equal(cost.maximumUsd, 0);
+  const metrics = { startedAt: 0, endedAt: 100, firstTokenAt: 10, status: 'complete', usage };
+  const mixed = aggregateMetrics([{ ...metrics, model: 'liquid/lfm-2.5-2.6b:free' },
+    { ...metrics, model: 'deepseek-v4-pro' }], 100, Date.UTC(2026, 8, 6, 12));
+  assert.equal(mixed.minimumCostUsd, calculateCost(usage, 'off-peak', 'deepseek-v4-pro').minimumUsd);
+  assert.equal(mixed.usage.total_tokens, 2400);
+  assert.equal(calculateCost(null, 'off-peak', 'liquid/lfm-2.5-2.6b:free'), null);
 });

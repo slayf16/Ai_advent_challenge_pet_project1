@@ -12,6 +12,7 @@ import {
   DEFAULT_SETTINGS,
   MAX_SYSTEM_PROMPT_LENGTH,
   MAX_TOKENS,
+  MODELS,
   settingsError,
   type ResponseSettings,
 } from '@/lib/chat-request';
@@ -55,13 +56,49 @@ export function ResponseSettingsPanel({
           Параметры ответа
         </h2>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          Все поля необязательны. Пустое поле не добавляет условий к ответу.
+          По умолчанию выбрана Flash. Остальные поля необязательны. Пустое поле
+          не добавляет условий к ответу.
         </p>
 
         <fieldset
           disabled={isSending}
           className="mt-5 space-y-5 disabled:opacity-60"
         >
+          <div className="space-y-2">
+            <label
+              htmlFor="deepseek-model"
+              className="block text-sm font-medium"
+            >
+              Модель
+            </label>
+            <NativeSelect
+              id="deepseek-model"
+              value={settings.model}
+              className="w-full [&_select]:h-10"
+              aria-describedby="model-hint"
+              onChange={(event) =>
+                onChange({
+                  ...settings,
+                  model: event.target.value as ResponseSettings['model'],
+                })
+              }
+            >
+              {MODELS.map((model) => (
+                <NativeSelectOption key={model.id} value={model.id}>
+                  {model.name} — {model.label}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+            <p
+              id="model-hint"
+              className="text-sm leading-5 text-muted-foreground"
+            >
+              {MODELS.find((model) => model.id === settings.model)?.description}{' '}
+              «Слабее» и «сильнее» — ориентир между этими моделями: результат
+              зависит от задачи. Выбор применяется к чату, всем экспертам и
+              итогу. Повтор использует текущую модель.
+            </p>
+          </div>
           <div className="space-y-2">
             <label
               htmlFor="system-prompt"
@@ -117,7 +154,7 @@ export function ResponseSettingsPanel({
                   ? ''
                   : (settings.maxTokens ?? '')
               }
-              placeholder="По умолчанию DeepSeek"
+              placeholder="По умолчанию модели"
               aria-describedby="tokens-hint"
               onChange={(event) =>
                 onChange({
@@ -134,8 +171,8 @@ export function ResponseSettingsPanel({
               id="tokens-hint"
               className="text-sm leading-5 text-muted-foreground"
             >
-              Пусто — лимит DeepSeek по умолчанию. Можно указать от 1 до 4 096
-              токенов. Токен — часть текста, не слово.
+              Пусто — лимит модели по умолчанию. Можно указать от 1 до 4 096
+              токенов. Токен — часть текста, не слово. У Liquid лимит включает рассуждения, поэтому слишком маленький лимит может не оставить места для ответа.
             </p>
           </div>
           <div className="space-y-2">
@@ -148,8 +185,12 @@ export function ResponseSettingsPanel({
               min={0}
               max={2}
               step="any"
-              value={Number.isNaN(settings.temperature) ? '' : (settings.temperature ?? '')}
-              placeholder="По умолчанию DeepSeek"
+              value={
+                Number.isNaN(settings.temperature)
+                  ? ''
+                  : (settings.temperature ?? '')
+              }
+              placeholder="По умолчанию модели"
               aria-describedby="temperature-hint"
               onChange={(event) =>
                 onChange({
@@ -162,11 +203,14 @@ export function ResponseSettingsPanel({
               }
               className="h-10"
             />
-            <p id="temperature-hint" className="text-sm leading-5 text-muted-foreground">
+            <p
+              id="temperature-hint"
+              className="text-sm leading-5 text-muted-foreground"
+            >
               От 0 до 2: ниже — более предсказуемые ответы, выше — более
-              разнообразные. Пусто — настройка DeepSeek по умолчанию.
-              При заданной температуре режим рассуждений отключается,
-              чтобы модель учитывала её значение.
+              разнообразные. Пусто — настройка модели по умолчанию. У DeepSeek
+              при заданной температуре режим рассуждений отключается, чтобы
+              модель учитывала её значение. У Liquid режим рассуждений обязателен.
             </p>
           </div>
           <div className="space-y-2">
@@ -246,7 +290,9 @@ export function ResponseSettingsPanel({
           variant="ghost"
           className="mt-3 h-10 w-full"
           disabled={isSending}
-          onClick={() => onChange({ ...DEFAULT_SETTINGS })}
+          onClick={() =>
+            onChange({ ...DEFAULT_SETTINGS, model: settings.model })
+          }
         >
           Очистить параметры
         </Button>
@@ -277,7 +323,7 @@ export function ResponseSettingsPanel({
       >
         <div className="border-b border-white/8 px-5 py-4">
           <h2 id="request-title" className="text-base font-semibold">
-            JSON запроса к DeepSeek
+            JSON запроса к модели
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Тело последнего запроса. Появляется сразу после того, как сервер

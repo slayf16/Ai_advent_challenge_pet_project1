@@ -107,3 +107,28 @@ test('whitespace-only system prompt does not create a system message', () => {
   });
   assert.deepEqual(request.messages, messages);
 });
+
+test('model allowlist accepts Flash and Pro, rejects unknown or malformed models', () => {
+  for (const model of ['deepseek-v4-flash', 'deepseek-v4-pro']) {
+    assert.equal(settingsError({ model }), null);
+    assert.equal(buildDeepSeekRequest(messages, { ...DEFAULT_SETTINGS, model }).model, model);
+  }
+  assert.equal(settingsError({}), null);
+  assert.equal(buildDeepSeekRequest(messages, DEFAULT_SETTINGS).model, 'deepseek-v4-flash');
+  for (const model of ['', 'deepseek-chat', 'unknown', null, 1, {}, ['deepseek-v4-pro']])
+    assert.match(settingsError({ model }), /модель/);
+});
+
+test('Liquid supports settings with mandatory reasoning and only the free model', () => {
+  const settings = { ...DEFAULT_SETTINGS, model: 'liquid/lfm-2.5-2.6b:free', maxTokens: 256, temperature: 0,
+    stopMode: 'sequence', stopSequence: '[END]' };
+  assert.equal(settingsError(settings), null);
+  const body = buildDeepSeekRequest(messages, settings);
+  assert.equal(body.model, settings.model);
+  assert.equal(body.max_tokens, 256);
+  assert.equal(body.temperature, 0);
+  assert.deepEqual(body.stop, ['[END]']);
+  assert.equal('reasoning' in body, false);
+  assert.equal('thinking' in body, false);
+  assert.match(settingsError({ model: 'liquid/lfm-2.5-2.6b' }), /модель/);
+});

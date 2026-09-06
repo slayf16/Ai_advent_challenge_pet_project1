@@ -1,14 +1,16 @@
 import {
-  buildDeepSeekRequest,
+  buildChatRequest,
   DEFAULT_SETTINGS,
   isValidMessage,
   MAX_MESSAGES,
+  FREE_MODEL,
   settingsError,
   type ResponseSettings,
 } from '../../../lib/chat-request';
 
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/chat/completions';
-const TIMEOUT_MS = 90_000;
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const TIMEOUT_MS = 300_000;
 const encoder = new TextEncoder();
 export const dynamic = 'force-dynamic';
 
@@ -84,7 +86,7 @@ async function* sseData(body: ReadableStream<Uint8Array>, signal: AbortSignal) {
         break;
       }
     }
-    if (buffer.trim()) throw new Error('Незавершённый SSE-кадр DeepSeek.');
+    if (buffer.trim()) throw new Error('Незавершённый SSE-кадр провайдера.');
   } finally {
     signal.removeEventListener('abort', cancelReader);
     if (!reachedEnd) await reader.cancel().catch(() => undefined);
@@ -129,21 +131,27 @@ export async function POST(request: Request) {
       { error: invalidSettings },
       { status: 400, headers: jsonHeaders },
     );
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const requestSettings = {
+    ...DEFAULT_SETTINGS,
+    ...(resolvedSettings as Partial<ResponseSettings>),
+  };
+  const isOpenRouter = requestSettings.model === FREE_MODEL;
+  const provider = isOpenRouter ? 'OpenRouter' : 'DeepSeek';
+  const keyName = isOpenRouter ? 'OPENROUTER_API_KEY' : 'DEEPSEEK_API_KEY';
+  const apiKey = (
+    isOpenRouter ? process.env.OPENROUTER_API_KEY : process.env.DEEPSEEK_API_KEY
+  )?.trim();
+  const timeoutMessage = `Таймаут приложения: ожидание ${provider} превысило 5 минут. Частичный ответ сохранён, если успел поступить.`;
   if (!apiKey)
     return Response.json(
       {
-        error:
-          'На сервере не задана переменная DEEPSEEK_API_KEY. Запрос в DeepSeek не отправлен.',
+        error: `На сервере не задана переменная ${keyName}. Запрос в ${provider} не отправлен.`,
       },
       { status: 503, headers: jsonHeaders },
     );
 
   const requestJson = JSON.stringify(
-    buildDeepSeekRequest(messages, {
-      ...DEFAULT_SETTINGS,
-      ...(resolvedSettings as Partial<ResponseSettings>),
-    }),
+    buildChatRequest(messages, requestSettings),
   );
   const abortController = new AbortController();
   let timedOut = false;
@@ -161,40 +169,47 @@ export async function POST(request: Request) {
 
   let upstream: Response;
   try {
-    upstream = await fetch(DEEPSEEK_API_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
+    upstream = await fetch(
+      isOpenRouter ? OPENROUTER_API_URL : DEEPSEEK_API_URL,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: requestJson,
+        signal: abortController.signal,
       },
-      body: requestJson,
-      signal: abortController.signal,
-    });
+    );
   } catch {
     cleanup();
     return Response.json(
       {
         error: timedOut
-          ? 'DeepSeek не ответил вовремя.'
-          : 'Не удалось связаться с DeepSeek.',
+          ? timeoutMessage
+          : `Не удалось связаться с ${provider}: соединение прервано или провайдер недоступен.`,
         requestJson,
       },
-      { status: 502, headers: jsonHeaders },
+      { status: timedOut ? 504 : 502, headers: jsonHeaders },
     );
   }
   if (!upstream.ok) {
     cleanup();
     void upstream.body?.cancel().catch(() => undefined);
     const errors: Record<number, string> = {
-      401: 'DeepSeek отклонил API-ключ. Проверьте переменную DEEPSEEK_API_KEY.',
-      402: 'На балансе DeepSeek недостаточно средств.',
-      429: 'DeepSeek временно ограничил частоту запросов. Попробуйте позже.',
+      401: `${provider} отклонил API-ключ. Проверьте переменную ${keyName}.`,
+      402: `${provider} ограничил доступ по балансу аккаунта. Проверьте аккаунт провайдера.`,
+      403: `${provider} запретил доступ к модели. Проверьте настройки аккаунта и доступность модели.`,
+      404: `${provider}: выбранная модель или её бесплатные провайдеры сейчас недоступны.`,
+      408: `${provider} вернул HTTP 408: истекло время ожидания у провайдера.`,
+      504: `${provider} вернул HTTP 504: истекло время ожидания у провайдера.`,
+      429: `${provider} временно ограничил запросы: достигнут лимит или модель перегружена. Попробуйте позже.`,
     };
     return Response.json(
       {
         error:
           errors[upstream.status] ||
-          `DeepSeek вернул ошибку ${upstream.status}.`,
+          `${provider} вернул ошибку HTTP ${upstream.status}.`,
         requestJson,
       },
       {
@@ -206,7 +221,7 @@ export async function POST(request: Request) {
   if (!upstream.body) {
     cleanup();
     return Response.json(
-      { error: 'DeepSeek вернул пустой поток.', requestJson },
+      { error: `${provider} вернул пустой поток.`, requestJson },
       { status: 502, headers: jsonHeaders },
     );
   }
@@ -240,13 +255,13 @@ export async function POST(request: Request) {
           try {
             chunk = JSON.parse(data);
           } catch {
-            throw new Error('DeepSeek вернул повреждённый поток данных.');
+            throw new Error(`${provider} вернул повреждённый поток данных.`);
           }
           if (!chunk || typeof chunk !== 'object' || Array.isArray(chunk))
-            throw new Error('DeepSeek вернул повреждённый поток данных.');
+            throw new Error(`${provider} вернул повреждённый поток данных.`);
           const record = chunk as Record<string, unknown>;
           if (record.error)
-            throw new Error('DeepSeek сообщил об ошибке в потоке.');
+            throw new Error(`${provider} сообщил об ошибке в потоке.`);
           if (typeof record.model === 'string' && record.model)
             model = record.model;
           const nextUsage = safeUsage(record.usage);
@@ -256,6 +271,8 @@ export async function POST(request: Request) {
             : null;
           if (choice && typeof choice === 'object') {
             const item = choice as Record<string, unknown>;
+            if (item.finish_reason === 'error')
+              throw new Error(`${provider} сообщил об ошибке в потоке.`);
             if (typeof item.finish_reason === 'string')
               finishReason = item.finish_reason;
             const delta = item.delta;
@@ -268,25 +285,26 @@ export async function POST(request: Request) {
             }
           }
         }
-        if (!doneSeen) throw new Error('DeepSeek преждевременно закрыл поток.');
+        if (!doneSeen)
+          throw new Error(`${provider} преждевременно закрыл поток.`);
         if (!contentSeen)
           throw new Error(
             finishReason === 'length'
               ? 'Лимит токенов исчерпан до появления ответа. Увеличьте лимит.'
-              : 'DeepSeek вернул пустой ответ. Проверьте лимит и стоп-строку.',
+              : `${provider} вернул пустой ответ. Проверьте лимит и стоп-строку.`,
           );
         if (!finishReason)
-          throw new Error('DeepSeek не указал причину завершения ответа.');
-        if (!model) throw new Error('DeepSeek не указал модель в потоке.');
+          throw new Error(`${provider} не указал причину завершения ответа.`);
+        if (!model) throw new Error(`${provider} не указал модель в потоке.`);
         emit('done', { finishReason, usage, model });
       } catch (error) {
         if (!request.signal.aborted && !downstreamCancelled)
           emit('error', {
             error: timedOut
-              ? 'DeepSeek не ответил вовремя.'
+              ? timeoutMessage
               : error instanceof Error
                 ? error.message
-                : 'Не удалось прочитать ответ DeepSeek.',
+                : `Не удалось прочитать ответ ${provider}.`,
           });
       } finally {
         cleanup();

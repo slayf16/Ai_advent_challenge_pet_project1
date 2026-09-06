@@ -25,6 +25,7 @@ const { POST } = await import(
 );
 const messages = [{ role: 'user', content: 'Объясни API.' }];
 const originalKey = process.env.DEEPSEEK_API_KEY;
+const originalRouterKey = process.env.OPENROUTER_API_KEY;
 let sent;
 
 const upstream = (parts, { status = 200 } = {}) =>
@@ -97,6 +98,7 @@ const post = (body, signal) =>
 
 beforeEach(() => {
   process.env.DEEPSEEK_API_KEY = 'unit-test-secret';
+  process.env.OPENROUTER_API_KEY = 'router-test-secret';
   sent = [];
   mock.method(globalThis, 'fetch', async (url, options) => {
     sent.push({ url, ...options });
@@ -105,6 +107,8 @@ beforeEach(() => {
 });
 afterEach(() => {
   mock.restoreAll();
+  if (originalRouterKey === undefined) delete process.env.OPENROUTER_API_KEY;
+  else process.env.OPENROUTER_API_KEY = originalRouterKey;
   if (originalKey === undefined) delete process.env.DEEPSEEK_API_KEY;
   else process.env.DEEPSEEK_API_KEY = originalKey;
 });
@@ -327,4 +331,105 @@ test('cancelling downstream while reading cancels upstream without controller er
       setTimeout(() => reject(new Error('upstream was not cancelled')), 500),
     ),
   ]);
+});
+
+test('selected model reaches upstream and JSON; omitted model defaults to Flash', async () => {
+  for (const model of ['deepseek-v4-flash', 'deepseek-v4-pro', undefined]) {
+    const response = await post({ messages, settings: { model } });
+    assert.equal(response.status, 200);
+    const events = await readEvents(response);
+    assert.equal(JSON.parse(sent.at(-1).body).model, model ?? 'deepseek-v4-flash');
+    assert.equal(events[0].data.requestJson, sent.at(-1).body);
+  }
+});
+test('invalid model is rejected before upstream', async () => {
+  for (const model of ['unknown', '', null, 42]) {
+    const response = await post({ messages, settings: { model } });
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /модель/);
+  }
+  assert.equal(sent.length, 0);
+});
+
+test('Liquid routes to OpenRouter with its own key and provider parameters, no DeepSeek key required', async () => {
+  delete process.env.DEEPSEEK_API_KEY;
+  const response = await post({ messages, settings: { model: 'liquid/lfm-2.5-2.6b:free', temperature: 0.4, maxTokens: 200 } });
+  const events = await readEvents(response);
+  assert.equal(events.at(-1).event, 'done');
+  assert.equal(sent[0].url, 'https://openrouter.ai/api/v1/chat/completions');
+  assert.equal(sent[0].headers.Authorization, 'Bearer router-test-secret');
+  const body = JSON.parse(sent[0].body);
+  assert.equal(body.model, 'liquid/lfm-2.5-2.6b:free');
+  assert.equal(body.temperature, 0.4);
+  assert.equal(body.max_tokens, 200);
+  assert.equal('reasoning' in body, false);
+  assert.equal('thinking' in body, false);
+  assert.equal('models' in body, false);
+  assert.equal(events[0].data.requestJson, sent[0].body);
+  assert.equal(JSON.stringify(events).includes('router-test-secret'), false);
+});
+test('missing OpenRouter key is actionable; DeepSeek still works independently', async () => {
+  delete process.env.OPENROUTER_API_KEY;
+  const response = await post({ messages, settings: { model: 'liquid/lfm-2.5-2.6b:free' } });
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /OPENROUTER_API_KEY/);
+  assert.equal(sent.length, 0);
+  await readEvents(await post({ messages }));
+  assert.equal(sent[0].url, 'https://api.deepseek.com/chat/completions');
+  assert.equal(sent[0].headers.Authorization, 'Bearer unit-test-secret');
+});
+test('OpenRouter error messages identify provider and do not expose upstream payload', async () => {
+  for (const status of [401, 403, 404, 429, 504]) {
+    globalThis.fetch.mock.mockImplementation(async () => new Response('private upstream payload', { status }));
+    const response = await post({ messages, settings: { model: 'liquid/lfm-2.5-2.6b:free' } });
+    const body = await response.json();
+    assert.match(body.error, /OpenRouter/);
+    assert.equal(body.error.includes('private'), false);
+    if (status === 401) assert.match(body.error, /OPENROUTER_API_KEY/);
+    if (status === 504) assert.match(body.error, /у провайдера/);
+  }
+});
+test('application timeout is five minutes and aborts pending connection with explicit 504', async () => {
+  let expire, delay, signal;
+  mock.method(globalThis, 'setTimeout', (callback, ms) => { expire = callback; delay = ms; return 1; });
+  mock.method(globalThis, 'clearTimeout', () => {});
+  globalThis.fetch.mock.mockImplementation((_url, options) => new Promise((_resolve, reject) => {
+    signal = options.signal;
+    signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  }));
+  const pending = post({ messages });
+  await new Promise(setImmediate);
+  assert.equal(delay, 300000);
+  assert.equal(signal.aborted, false);
+  expire();
+  const response = await pending;
+  assert.equal(signal.aborted, true);
+  assert.equal(response.status, 504);
+  assert.match((await response.json()).error, /Таймаут приложения.*5 минут/);
+});
+test('five-minute streaming timeout preserves deltas and cancels upstream', async () => {
+  let expire, cancelled = false;
+  mock.method(globalThis, 'setTimeout', (callback, ms) => { assert.equal(ms, 300000); expire = callback; return 1; });
+  mock.method(globalThis, 'clearTimeout', () => {});
+  globalThis.fetch.mock.mockImplementation(async () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode(chunk({ model: 'liquid/lfm-2.5-2.6b', choices: [{ delta: { content: 'Часть' } }] }))); },
+    cancel() { cancelled = true; },
+  })));
+  const response = await post({ messages, settings: { model: 'liquid/lfm-2.5-2.6b:free' } });
+  const pending = readEvents(response);
+  await new Promise(setImmediate);
+  expire();
+  const events = await pending;
+  assert.equal(events.find((event) => event.event === 'delta').data.content, 'Часть');
+  assert.match(events.at(-1).data.error, /Таймаут приложения.*OpenRouter/);
+  assert.equal(cancelled, true);
+});
+test('OpenRouter finish_reason error is never reported as success', async () => {
+  globalThis.fetch.mock.mockImplementation(async () => upstream([
+    chunk({ model: 'liquid/lfm-2.5-2.6b', choices: [{ delta: { content: 'Часть' }, finish_reason: 'error' }] }),
+    'data: [DONE]\n\n',
+  ]));
+  const events = await readEvents(await post({ messages, settings: { model: 'liquid/lfm-2.5-2.6b:free' } }));
+  assert.equal(events.at(-1).event, 'error');
+  assert.match(events.at(-1).data.error, /OpenRouter/);
 });
