@@ -18,6 +18,8 @@ import {
 } from '@/lib/chat-request';
 
 type Props = {
+  agentName: string;
+  onAgentNameChange: (name: string) => void;
   settings: ResponseSettings;
   onChange: (settings: ResponseSettings) => void;
   isSending: boolean;
@@ -26,7 +28,17 @@ type Props = {
   requestJson: string | null;
 };
 
+const prettyJson = (value: string) => {
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return value;
+  }
+};
+
 export function ResponseSettingsPanel({
+  agentName,
+  onAgentNameChange,
   settings,
   onChange,
   isSending,
@@ -38,7 +50,7 @@ export function ResponseSettingsPanel({
 
   return (
     <aside
-      className="min-w-0 space-y-4 lg:sticky lg:top-6 lg:self-start"
+      className="min-w-0 space-y-4 lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain lg:pr-1"
       aria-label="Параметры запроса"
     >
       <section
@@ -55,6 +67,23 @@ export function ResponseSettingsPanel({
           />
           Параметры ответа
         </h2>
+        <div className="mt-5 space-y-2">
+          <label htmlFor="agent-name" className="block text-sm font-medium">
+            Имя агента
+          </label>
+          <Input
+            id="agent-name"
+            value={agentName}
+            maxLength={80}
+            disabled={isSending}
+            onChange={(event) => onAgentNameChange(event.target.value)}
+            placeholder="Например: Строгий редактор"
+            className="h-10"
+          />
+          <p className="text-sm leading-5 text-muted-foreground">
+            У каждого чата свой агент и собственные параметры модели.
+          </p>
+        </div>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
           По умолчанию выбрана Flash. Остальные поля необязательны. Пустое поле
           не добавляет условий к ответу.
@@ -334,7 +363,7 @@ export function ResponseSettingsPanel({
           <Textarea
             readOnly
             aria-label="Отправленный JSON"
-            value={JSON.stringify(JSON.parse(requestJson), null, 2)}
+            value={prettyJson(requestJson)}
             className="min-h-72 max-h-96 resize-y rounded-none border-0 p-5 font-mono text-sm leading-6 text-foreground/85"
           />
         ) : (
