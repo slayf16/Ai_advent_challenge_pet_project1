@@ -20,7 +20,7 @@ const { aggregateMetrics, metricsSnapshot, pricingSnapshotForModel } = await imp
 test('exact five tail and long prefix stay packet-safe', () => {
   const messages = Array.from({ length: 40 }, (_, i) => ({ id: String(i), role: i % 2 ? 'assistant' : 'user', content: 'x'.repeat(12000), ...(i % 2 ? { metrics: { status: 'complete' } } : {}) }));
   const plan = summaryPlan(messages, null);
-  assert.equal(plan.batch.length, 35); assert.deepEqual(summaryPlan(messages, { content: 'folded', coveredThroughMessageId: '34' }).raw.map((m) => m.id), ['35','36','37','38','39']);
+  assert.equal(plan.batch.length, 35); assert.deepEqual(plan.batch.slice(0, 5).map((m) => m.id), ['0','1','2','3','4']); assert.deepEqual(summaryPlan(messages, { content: 'folded', coveredThroughMessageId: '34' }).raw.map((m) => m.id), ['35','36','37','38','39']);
   assert.ok(plan.batch.every((m) => m.content.length <= 12000));
 });
 test('strategy migration defaults to summary and none persists without deleting raw', () => {

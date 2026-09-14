@@ -103,8 +103,11 @@ export function ResponseSettingsPanel({
             <NativeSelect id="context-strategy" value={contextStrategy} className="w-full [&_select]:h-10" onChange={(event) => onContextStrategyChange(event.target.value as ContextStrategy)}>
               <NativeSelectOption value="summary">Суммаризация</NativeSelectOption>
               <NativeSelectOption value="none">Без всего</NativeSelectOption>
+              <NativeSelectOption value="sliding">Скользящее окно (5 сообщений)</NativeSelectOption>
+              <NativeSelectOption value="facts">Sticky Facts + 5 сообщений</NativeSelectOption>
+              <NativeSelectOption value="branch">Ветка: полный путь</NativeSelectOption>
             </NativeSelect>
-            <p className="text-sm text-muted-foreground">Без суммаризации отправляется полная raw-история; при лимите сервера появится ошибка до запроса.</p>
+            <p className="text-sm text-muted-foreground">Скользящее окно передаёт пять последних завершённых реплик. Sticky Facts сначала обновляет карту фактов отдельным вызовом, затем передаёт факты как данные и пять реплик. Ветка передаёт полный активный путь и при нехватке вместимости явно остановится до запроса.</p>
           </div>
           <div className="space-y-2">
             <label

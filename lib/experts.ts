@@ -101,7 +101,9 @@ export function expertMessages(
   };
   if (data.content.length > MAX_MESSAGE_LENGTH)
     throw new Error('Сократите данные до 11 900 символов.');
-  return [...history.slice(-(MAX_MESSAGES - 1)), data];
+  if (history.length + 1 > MAX_MESSAGES)
+    throw new Error('Контекст вместе с данными не помещается в запрос экспертов. Сократите историю или включите суммаризацию.');
+  return [...history, data];
 }
 
 // Split complete answers into valid message-sized packets. Never silently cut an expert's answer.
@@ -122,13 +124,13 @@ export function synthesisMessages(
       });
     }
   }
-  if (packets.length > MAX_MESSAGES - 3) {
+  if (history.length + packets.length + 1 > MAX_MESSAGES) {
     throw new Error(
-      'Ответы экспертов слишком велики для итогового запроса. Задайте меньший лимит токенов и повторите запуск. Полные ответы сохранены в панелях.',
+      'История и ответы экспертов не помещаются в итоговый запрос. Сократите контекст или лимит ответов и повторите запуск. Полные ответы сохранены в панелях.',
     );
   }
   return [
-    ...history.slice(-(MAX_MESSAGES - packets.length - 1)),
+    ...history,
     ...packets,
     {
       role: 'user',

@@ -16,6 +16,7 @@ export type PricingSnapshot = {
 };
 export type RequestMetrics = {
   requestId?: string;
+  requestJson?: string;
   model?: ChatModel;
   pricingSnapshot?: PricingSnapshot;
   startedAt: number;

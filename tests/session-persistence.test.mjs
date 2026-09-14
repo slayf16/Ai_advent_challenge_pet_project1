@@ -61,7 +61,7 @@ test('recovery keeps request links, summary boundary and independent usage field
   assert.equal(physicalRequests(session).length, 1, 'physical IDs are deduplicated, never inferred by position');
 });
 
-test('summary covers the entire eligible prefix and leaves exactly five raw messages', () => {
+test('summary waits for ten eligible rows and advances exactly one five-row checkpoint', () => {
   const messages = Array.from({ length: 20 }, (_, index) => ({
     id: String(index), role: index % 2 ? 'assistant' : 'user', content: `m${index}`,
     ...(index % 2 ? { metrics: { status: 'complete' } } : {}),
@@ -71,11 +71,14 @@ test('summary covers the entire eligible prefix and leaves exactly five raw mess
     assert.equal(plan.batch, null);
     assert.deepEqual(plan.raw.map((item) => item.id), Array.from({ length: size }, (_, i) => String(i)));
   }
+  const beforeThreshold = summaryPlan(messages.slice(0, 9), null);
+  assert.equal(beforeThreshold.batch, null);
   const plan = summaryPlan(messages, null);
   assert.deepEqual(plan.batch.map((item) => item.id), Array.from({ length: 15 }, (_, i) => String(i)));
   assert.deepEqual(plan.raw.map((item) => item.id), Array.from({ length: 20 }, (_, i) => String(i)));
-  const advanced = summaryPlan(messages, { content: 'summary', coveredThroughMessageId: '14' });
-  assert.deepEqual(advanced.raw.map((item) => item.id), Array.from({ length: 5 }, (_, i) => String(i + 15)));
+  const advanced = summaryPlan(messages, { content: 'summary', coveredThroughMessageId: '4' });
+  assert.deepEqual(advanced.raw.map((item) => item.id), Array.from({ length: 15 }, (_, i) => String(i + 5)));
+  assert.deepEqual(advanced.batch.map((item) => item.id), Array.from({ length: 10 }, (_, i) => String(i + 5)));
 });
 
 test('deleting inactive, active and last chats keeps an independently restorable session', () => {

@@ -81,18 +81,23 @@ function setup() {
   return calls;
 }
 
-async function seedCompletedTurns(calls, count = 10) {
+async function seedCompletedTurns(calls, count = 11) {
   for (let index = 0; index < count; index++) {
     const pending = render().send(`history-${index}`);
-    const firstCall = calls.at(-1);
-    firstCall.resolve(response(`answer-${index}`));
-    await tick();
-    // A seeded turn can first issue a summary. Resolve the following main
-    // request as well; bounded iterations turn a harness mismatch into a fail.
-    if (calls.at(-1) !== firstCall) {
-      calls.at(-1).resolve(response(`answer-${index}`));
+    let settled = false;
+    void pending.finally(() => { settled = true; });
+    let seen = calls.length - 1;
+    // A legacy backlog can need several five-row checkpoint requests before
+    // its main call. Resolve every physical request until the stateful send
+    // settles; the bound catches a future non-progressing loop.
+    for (let safety = 0; !settled && safety < 20; safety++) {
+      const call = calls[seen];
+      assert.ok(call, 'seeded request must create a physical call');
+      call.resolve(response(`answer-${index}`));
       await tick();
+      if (calls.length > seen + 1) seen += 1;
     }
+    assert.ok(settled, 'seeded request must settle within bounded physical calls');
     await pending;
     await tick();
   }
@@ -104,22 +109,36 @@ test('summary is a physical request, preserves raw order and retry does not adva
   const before = calls.length;
   const pending = render().send('new question');
   assert.equal(calls.length, before + 1, 'new request starts one summary before the main request');
-  const summaryCall = calls.at(-1);
-  assert.ok(summaryCall.body.messages.length <= 26, 'summary packet stays below transport message cap');
-  assert.equal(summaryCall.body.settings.model, 'deepseek-v4-flash');
-  summaryCall.resolve(response('compressed context'));
-  await tick();
-  assert.equal(calls.length, before + 2);
+  let summaryCall = calls.at(-1);
+  for (let safety = 0; safety < 10 && summaryCall.body.messages[0]?.content.startsWith('Сожми'); safety++) {
+    assert.ok(summaryCall.body.messages.length <= 30, 'summary packet stays below transport cap');
+    assert.equal(summaryCall.body.settings.model, 'deepseek-v4-flash');
+    summaryCall.resolve(response('compressed context'));
+    await tick();
+    summaryCall = calls.at(-1);
+  }
   const mainCall = calls.at(-1);
   const context = mainCall.body.messages.map((item) => item.content).join('\n');
   assert.match(context, /compressed context/);
-  assert.match(context, /history-8/);
+  assert.match(context, /history-9/);
   assert.match(context, /new question/);
   mainCall.resolve(response('final'));
   await pending;
   const chat = render();
-  assert.equal(chat.messages.length, 22, 'raw UI history remains complete');
+  assert.equal(chat.messages.length, 24, 'raw UI history remains complete');
   assert.equal(chat.metrics.filter((item) => item.requestId).length, calls.length, 'summary is counted once beside every physical call');
+});
+
+test('summary waits through the first five turns, checkpoints at threshold, survives reload, and retry does not recompress', async () => {
+  const calls=setup(); await seedCompletedTurns(calls,5);
+  assert.equal(calls.length,5,'no summary while the first ten eligible rows only become history after a turn');
+  const pending=render().send('threshold'); const summary=calls.at(-1);
+  assert.match(summary.body.messages[0].content,/Сожми/); summary.resolve(response('checkpoint')); await tick();
+  calls.at(-1).resolve(response('answer')); await pending;
+  const restored=recoverSession(render().sessions[0]); host.reset([restored,[restored],restored.id,true]);
+  const before=calls.length; const next=render().send('after reload');
+  assert.equal(calls.length,before+1,'fresh suffix below threshold has no summary'); calls.at(-1).resolve(response('next')); await next;
+  const retryBefore=calls.length; const retry=render().repeat(); assert.equal(calls.length,retryBefore+1,'retry uses saved snapshot'); calls.at(-1).resolve(response('retry')); await retry;
 });
 
 test('summary abort and failure retain old raw context and retry can start a fresh summary', async () => {
@@ -130,15 +149,15 @@ test('summary abort and failure retain old raw context and retry can start a fre
   calls.at(-1).reject(new Error('summary transport failed'));
   await assert.rejects(failed, /summary transport failed/);
   let chat = render();
-  assert.equal(chat.messages.length, 20);
-  assert.equal(chat.lastRequest.prompt, 'history-9', 'failed summary does not replace the prior retry snapshot');
+  assert.equal(chat.messages.length, 23, 'failed summary remains linked to its visible unsent input');
+  assert.equal(chat.lastRequest.prompt, 'history-10', 'failed summary does not replace the prior retry snapshot');
   assert.equal(chat.metrics.at(-1).status, 'error');
   const retry = render().send('retry');
   assert.equal(calls.length, before + 2, 'retry begins another summary from unchanged raw history');
   render().stop();
   await assert.rejects(retry);
   chat = render();
-  assert.equal(chat.messages.length, 20);
+  assert.equal(chat.messages.length, 24);
   assert.equal(chat.metrics.at(-1).status, 'cancelled');
 });
 
@@ -155,7 +174,7 @@ test('invalid council preparation never starts summary or locks the chat', async
     const chat = render();
     assert.equal(chat.isSending, false);
     assert.equal(chat.phase, '');
-    assert.equal(chat.messages.length, 20);
+    assert.equal(chat.messages.length, 22);
     assert.equal(calls.length, before, 'invalid input must not pay for summary');
   }
   const chat = render();
@@ -170,9 +189,11 @@ test('council and synthesis retain summary data while every transport request st
   await seedCompletedTurns(calls);
   const before = calls.length;
   const pending = render().send('council question', { council: true, topic: 'tests' });
-  calls.at(-1).resolve(response('compressed council context'));
-  await tick();
-  assert.equal(calls.length, before + 4, 'three experts start after one summary');
+  for (let safety = 0; safety < 10 && calls.at(-1).body.messages[0]?.content.startsWith('Сожми'); safety++) {
+    calls.at(-1).resolve(response('compressed council context'));
+    await tick();
+  }
+  assert.equal(calls.length, before + 5, 'three experts start after checkpoint batches');
   for (const call of calls.slice(-3)) {
     assert.ok(call.body.messages.length <= 30);
     assert.match(call.body.messages.map((item) => item.content).join('\n'), /compressed council context/);
@@ -241,12 +262,20 @@ test('packetizer accepts 24001 raw and 72000 previous summary under transport ca
   const pending=render().send('next'); for(let i=0;i<5&&calls.length;i++){const call=calls.at(-1);assert.ok(call.body.messages.length<=30);assert.ok(call.body.messages.every(m=>m.content.length<=12000));call.resolve(response(`s${i}`));await tick();if(calls.at(-1)===call)break;} calls.at(-1).resolve(response('final'));await pending;
 });
 
+test('29 summary chunks reject locally before fetch and leave the chat unlocked', async () => {
+  const messages=[{id:'covered',role:'user',content:'old'}];
+  for(let i=0;i<10;i++) messages.push({id:`m${i}`,role:i%2?'assistant':'user',content:'x',...(i%2?{metrics:{status:'complete'}}:{})});
+  const session={id:'large-summary',title:'x',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages,runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:{content:'p'.repeat(348001),coveredThroughMessageId:'covered'},summaryMetrics:[],factsMetrics:[],facts:{},contextStrategy:'summary',lastMainRequestJson:null,comparison:null};
+  host.reset([session,[session],session.id,true]); let fetches=0; mock.method(globalThis,'fetch',()=>{fetches++;});
+  await assert.rejects(render().send('next'),/сводка слишком велика/); assert.equal(fetches,0); assert.equal(render().isSending,false);
+});
+
 test('none 350k context rejects before transport', async () => {
   const session={id:'n',title:'n',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages:[{id:'u',role:'user',content:'x'},{id:'a',role:'assistant',content:'x'.repeat(350000),metrics:{status:'complete'}}],runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:null,summaryMetrics:[],contextStrategy:'none',lastMainRequestJson:null,comparison:null}; host.reset([session,[session],session.id,true]); let n=0;mock.method(globalThis,'fetch',()=>{n++;});await assert.rejects(render().send('next'),/превышает лимит/);assert.equal(n,0);assert.equal(render().isSending,false);
 });
 
-test('summary 350k row folds through bounded physical requests', async () => {
-  const calls=[]; const session={id:'s',title:'s',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages:[{id:'old',role:'user',content:'old'},{id:'huge',role:'assistant',content:'x'.repeat(350000),metrics:{status:'complete'}},{id:'u2',role:'user',content:'2'},{id:'a2',role:'assistant',content:'2',metrics:{status:'complete'}},{id:'u3',role:'user',content:'3'},{id:'a3',role:'assistant',content:'3',metrics:{status:'complete'}},{id:'u4',role:'user',content:'4'},{id:'a4',role:'assistant',content:'4',metrics:{status:'complete'}}],runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:null,summaryMetrics:[],contextStrategy:'summary',lastMainRequestJson:null,comparison:null};host.reset([session,[session],session.id,true]);mock.method(globalThis,'fetch',(u,o)=>new Promise(resolve=>calls.push({body:JSON.parse(o.body),resolve})));const pending=render().send('next');for(let i=0;i<40&&calls.length;i++){const c=calls.at(-1);assert.ok(c.body.messages.length<=30);assert.ok(c.body.messages.every(m=>m.content.length<=12000));c.resolve(response(`f${i}`));await tick();if(calls.at(-1)===c)break;}calls.at(-1).resolve(response('main'));await pending;assert.ok(calls.length>1);
+test('summary 350k row folds through bounded calls, persists checkpoint, and does not refold after recovery', async () => {
+  const calls=[]; const session={id:'s',title:'s',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages:[{id:'old',role:'user',content:'old'},{id:'huge',role:'assistant',content:'x'.repeat(350000),metrics:{status:'complete'}},{id:'u2',role:'user',content:'2'},{id:'a2',role:'assistant',content:'2',metrics:{status:'complete'}},{id:'u3',role:'user',content:'3'},{id:'a3',role:'assistant',content:'3',metrics:{status:'complete'}},{id:'u4',role:'user',content:'4'},{id:'a4',role:'assistant',content:'4',metrics:{status:'complete'}},{id:'u5',role:'user',content:'5'},{id:'a5',role:'assistant',content:'5',metrics:{status:'complete'}}],runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:null,summaryMetrics:[],contextStrategy:'summary',lastMainRequestJson:null,comparison:null};host.reset([session,[session],session.id,true]);mock.method(globalThis,'fetch',(u,o)=>new Promise(resolve=>calls.push({body:JSON.parse(o.body),resolve})));const pending=render().send('next');for(let i=0;i<40&&calls.length;i++){const c=calls.at(-1);assert.ok(c.body.messages.length<=30);assert.ok(c.body.messages.every(m=>m.content.length<=12000));c.resolve(response(`f${i}`));await tick();if(calls.at(-1)===c)break;}calls.at(-1).resolve(response('main'));await pending;const persisted=recoverSession(render().sessions[0]);assert.equal(persisted.summary.coveredThroughMessageId,'u3');assert.ok(render().comparison);const before=calls.length;host.reset([persisted,[persisted],persisted.id,true]);const next=render().send('after reload');assert.equal(calls.length,before+1,'checkpoint prevents another giant fold');calls.at(-1).resolve(response('after'));await next;
 });
 
 test('failed 350k fold does not commit a partial logical cutoff', async () => {
@@ -255,7 +284,7 @@ test('failed 350k fold does not commit a partial logical cutoff', async () => {
 
 test('comparison records previous and current actual main request JSON only after summary success', async () => {
   const calls = setup();
-  await seedCompletedTurns(calls, 4);
+  await seedCompletedTurns(calls, 5);
   const before = render();
   before.setContextStrategy('summary');
   const pending = render().send('compare');
@@ -416,7 +445,7 @@ test('failed partial output remains visible but is excluded from future ordinary
   await next;
 });
 
-test('large expert answers are split losslessly into valid API messages while keeping the current question', () => {
+test('large expert answers fail explicitly rather than silently dropping early history', () => {
   const content = '0123456789'.repeat(4000);
   const answers = EXPERT_ROLES.map((role) => ({
     id: role.id,
@@ -427,17 +456,7 @@ test('large expert answers are split losslessly into valid API messages while ke
     role: 'user',
     content: `Вопрос ${i}`,
   }));
-  const output = synthesisMessages(history, answers);
-  assert.ok(output.length <= 30);
-  assert.ok(output.every((m) => m.content.length <= 12000));
-  assert.ok(output.some((m) => m.content === 'Вопрос 28'));
-  for (const role of EXPERT_ROLES) {
-    const restored = output
-      .filter((m) => m.content.startsWith(`Материал эксперта «${role.title}»`))
-      .map((m) => m.content.split(/Часть \d+:\n/)[1])
-      .join('');
-    assert.equal(restored, content);
-  }
+  assert.throws(() => synthesisMessages(history, answers), /не помещаются/);
 });
 
 test('an ordinary follow-up remains valid after a long generated answer', async () => {
@@ -510,6 +529,80 @@ test('new chats receive isolated Agents, history and settings', async () => {
   assert.equal(secondChat.settings.model, 'deepseek-v4-pro');
   assert.equal(secondChat.messages.at(-1).content, 'Ответ первого агента');
   assert.equal(secondChat.sessions.length, 2);
+});
+
+test('sticky facts updates, corrects and deletes atomically, persists, and retry skips extraction', async () => {
+  const calls = setup();
+  const chat = render();
+  chat.setContextStrategy('facts');
+  const first = render().send('Меня зовут Анна');
+  assert.match(calls.at(-1).body.messages[0].content, /Извлеки устойчивые факты/);
+  calls.at(-1).resolve(response('{"имя":"Анна"}')); await tick();
+  assert.match(calls.at(-1).body.messages.map((m) => m.content).join('\n'), /"имя":"Анна"/);
+  calls.at(-1).resolve(response('Привет, Анна')); await first;
+  assert.deepEqual(render().facts, { имя: 'Анна' });
+  const factsMetric=render().sessions[0].factsMetrics[0]; assert.equal(factsMetric.requestJson,'{}'); assert.ok(factsMetric.firstTokenAt); assert.equal(recoverSession(render().sessions[0]).factsMetrics[0].requestJson,'{}');
+  const second = render().send('Исправление: имя Боб, прежнее имя удалить');
+  calls.at(-1).resolve(response('{"имя":"Боб","устаревший":null}')); await tick();
+  calls.at(-1).resolve(response('Привет, Боб')); await second;
+  assert.deepEqual(render().facts, { имя: 'Боб' });
+  const restored = recoverSession(render().sessions[0]);
+  assert.deepEqual(restored.facts, { имя: 'Боб' });
+  const beforeRetry = calls.length;
+  const retry = render().repeat();
+  assert.equal(calls.length, beforeRetry + 1, 'saved main snapshot skips another facts extraction');
+  calls.at(-1).resolve(response('retry')); await retry;
+});
+
+test('sliding window sends exactly five prior eligible rows after reload and retry keeps its snapshot', async () => {
+  const calls=setup(); await seedCompletedTurns(calls,4); render().setContextStrategy('sliding');
+  const session=recoverSession(render().sessions[0]); host.reset([session,[session],session.id,true]);
+  const pending=render().send('sliding'); const body=calls.at(-1).body.messages;
+  assert.equal(body.length,6); assert.deepEqual(body.slice(0,-1).map((m)=>m.content), session.messages.filter((m)=>m.role==='user'||m.metrics?.status==='complete').slice(-5).map((m)=>m.content));
+  calls.at(-1).resolve(response('ok')); await pending; const before=calls.length; const retry=render().repeat(); assert.equal(calls.length,before+1); calls.at(-1).resolve(response('again')); await retry;
+});
+
+test('sticky facts invalid JSON, transport error and cancellation never start main and unlock the hook', async () => {
+  const calls = setup();
+  render().setContextStrategy('facts');
+  const invalid = render().send('bad facts');
+  calls.at(-1).resolve(response('not-json'));
+  await assert.rejects(invalid, /некорректный JSON фактов/);
+  assert.equal(render().isSending, false); assert.equal(calls.length, 1);
+  const failed = render().send('transport error');
+  calls.at(-1).reject(new Error('facts failed'));
+  await assert.rejects(failed, /facts failed/);
+  assert.equal(render().isSending, false); assert.equal(calls.length, 2);
+  const cancelled = render().send('cancel facts');
+  render().stop();
+  await assert.rejects(cancelled);
+  assert.equal(render().isSending, false); assert.equal(calls.length, 3);
+  const input = render().messages.at(-1);
+  assert.ok(input.requestIds?.length, 'failed updater remains linked to its visible user input');
+});
+
+test('two sibling branches retain one checkpoint, isolated suffixes, switch/recover, and branch-local retry', async () => {
+  const calls = setup();
+  await seedCompletedTurns(calls, 5);
+  const root = render();
+  root.forkBranches();
+  let chat = render();
+  const a = chat.sessions.find((session) => session.title.endsWith('ветка A'));
+  const b = chat.sessions.find((session) => session.title.endsWith('ветка B'));
+  assert.ok(a && b); assert.equal(a.summary?.coveredThroughMessageId, b.summary?.coveredThroughMessageId);
+  const branchA = chat.activeSessionId;
+  const sendA = chat.send('only A'); calls.at(-1).resolve(response('answer A')); await sendA;
+  chat = render(); chat.setActiveSession(b.id);
+  const sendB = render().send('only B'); calls.at(-1).resolve(response('answer B')); await sendB;
+  chat = render(); chat.setActiveSession(branchA);
+  assert.ok(render().messages.some((m) => m.content === 'only A'));
+  assert.ok(!render().messages.some((m) => m.content === 'only B'));
+  const restored = restoreStore(JSON.stringify({ sessions: render().sessions, activeSessionId: branchA }));
+  assert.equal(restored.sessions.length, 3);
+  assert.ok(restored.sessions.find((s) => s.id === b.id)?.messages.some((m) => m.content === 'only B'));
+  host.reset([restored.sessions, restored.sessions, restored.activeSessionId, true]);
+  const before = calls.length; const retry = render().repeat();
+  assert.equal(calls.length, before + 1); calls.at(-1).resolve(response('retry A')); await retry;
 });
 
 test('storage recovery keeps valid session data and drops malformed nested fields', () => {

@@ -262,6 +262,9 @@ export default function Home() {
             <Plus className="size-4" />
             <span>Новый диалог</span>
           </Button>
+          <Button type="button" variant="outline" className="rounded-xl border-white/10 bg-white/4" onClick={chat.forkBranches} disabled={chat.isSending}>
+            Создать ветки A/B
+          </Button>
           <Link href="/statistics" className="rounded-xl px-3 py-2 text-sm hover:bg-white/5">Статистика</Link>
         </header>
 
@@ -284,7 +287,7 @@ export default function Home() {
                     className={`w-full rounded-xl px-3 py-2 text-left text-sm transition-colors ${session.id === chat.activeSessionId ? 'bg-primary/15 text-foreground' : 'text-muted-foreground hover:bg-white/5'}`}
                   >
                     <span className="block truncate font-medium">{session.title}</span>
-                    <span className="mt-0.5 block truncate text-xs opacity-75">{session.agent.name}</span>
+                    <span className="mt-0.5 block truncate text-xs opacity-75">{session.agent.name}{session.parentSessionId ? ' · ветка' : ''}</span>
                   </button>
                   <Button type="button" variant="ghost" size="icon" disabled={chat.isSending} aria-label={`Удалить чат ${session.title}`} onClick={() => setDeleteId(session.id)}>
                     <Trash2 className="size-4" />
@@ -421,9 +424,15 @@ export default function Home() {
                   <div className="mt-4">
                     <AggregateMetricsView
                       metrics={metrics}
-                      label="За весь диалог"
+                      label="Расход за весь диалог"
                     />
                   </div>
+                )}
+                {chat.contextStrategy === 'facts' && (
+                  <section className="mt-4 rounded-xl border border-white/10 bg-card/50 p-4" aria-label="Карта фактов">
+                    <h3 className="font-medium">Карта фактов</h3>
+                    <pre className="mt-2 overflow-x-auto text-xs text-muted-foreground">{JSON.stringify(chat.facts, null, 2)}</pre>
+                  </section>
                 )}
                 <div className="flex flex-1 flex-col">
               {!chat.messages.length ? (
