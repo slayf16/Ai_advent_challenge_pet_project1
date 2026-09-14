@@ -28,6 +28,7 @@ import { ExpertPanel } from '@/components/expert-panel';
 import {
   AggregateMetricsView,
   RequestMetricsView,
+  UserInputMetrics,
 } from '@/components/request-metrics';
 import { AcceptedChatError, useChat } from '@/hooks/use-chat';
 import { MODELS, settingsError } from '@/lib/chat-request';
@@ -443,6 +444,10 @@ export default function Home() {
                                 ? 'Ожидаем первые токены…'
                                 : 'Ответ не получен.')}
                           </div>
+                          {message.role === 'user' && message.requestIds?.map((requestId) => {
+                            const request = metrics.find((item) => item.requestId === requestId);
+                            return request ? <UserInputMetrics key={requestId} metrics={request} /> : <p key={requestId} className="mt-2 text-xs">Вход запроса: Нет данных</p>;
+                          })}
                           {message.finishReason === 'length' && (
                             <p className="mt-3 text-sm text-amber-200">
                               Ответ обрезан по лимиту токенов. Увеличьте лимит и

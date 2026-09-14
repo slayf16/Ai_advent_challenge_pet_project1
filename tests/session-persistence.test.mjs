@@ -11,6 +11,11 @@ const moduleUrl = (source) =>
 const read = (path) => readFile(new URL(path, import.meta.url), 'utf8');
 const requestUrl = moduleUrl(await read('../lib/chat-request.ts'));
 const streamUrl = moduleUrl(await read('../lib/chat-stream.ts'));
+const metricsUrl = moduleUrl(
+  (await read('../lib/chat-metrics.ts'))
+    .replace('./chat-request', requestUrl)
+    .replace('./chat-stream', streamUrl),
+);
 const expertsUrl = moduleUrl(
   (await read('../lib/experts.ts')).replace('./chat-request', requestUrl),
 );
@@ -33,7 +38,8 @@ const hookSource = (await read('../hooks/use-chat.ts'))
   .replace('react', reactUrl)
   .replace('@/lib/agent', agentUrl)
   .replace('@/lib/chat-request', requestUrl)
-  .replace('@/lib/experts', expertsUrl);
+  .replace('@/lib/experts', expertsUrl)
+  .replace('@/lib/chat-metrics', metricsUrl);
 const { recoverSession, useChat } = await import(moduleUrl(hookSource));
 const host = await import(reactUrl);
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -101,6 +107,29 @@ test('restoration retains long outputs and turns an interrupted council run into
   assert.equal(recovered.runs[0].experts[0].content, longOutput);
   assert.deepEqual(recovered.runs[0].experts.map((expert) => expert.status), ['complete', 'cancelled', 'cancelled']);
   assert.deepEqual(recovered.runs[0].experts.map((expert) => expert.metrics.status), ['complete', 'cancelled', 'cancelled']);
+});
+
+test('legacy metrics receive a marked inferred pricing snapshot while message text is estimated', () => {
+  const recovered = recoverSession({
+    id: 'saved', title: 'Сохранённый', updatedAt: 1,
+    agent: { id: 'agent', name: 'Агент', settings: { model: 'deepseek-v4-pro' } },
+    messages: [{ id: 'user', role: 'user', content: 'абвг', metrics: { model: 'deepseek-v4-pro', startedAt: 1_700_000_000_000, firstTokenAt: null, endedAt: 1_700_000_000_100, usage: null, status: 'complete' } }],
+    runs: [],
+  });
+  assert.equal(recovered.messages[0].metrics.pricingSnapshot.legacyInferred, true);
+  assert.equal(recovered.messages[0].metrics.pricingSnapshot.model, 'deepseek-v4-pro');
+});
+
+test('recovery keeps an empty cancelled assistant, drops malformed usage and freezes its timer', () => {
+  const recovered = recoverSession({
+    id: 'saved', title: 'Сохранённый', updatedAt: 1_700_000_000_500,
+    agent: { id: 'agent', name: 'Агент', settings: {} }, runs: [],
+    messages: [{ id: 'answer', role: 'assistant', content: '', metrics: { model: 'deepseek-v4-flash', startedAt: 1_700_000_000_000, firstTokenAt: null, endedAt: null, usage: { prompt_tokens: null, completion_tokens: 'bad', total_tokens: 4 }, status: 'running' } }],
+  });
+  assert.equal(recovered.messages.length, 1);
+  assert.equal(recovered.messages[0].metrics.status, 'cancelled');
+  assert.equal(recovered.messages[0].metrics.endedAt, 1_700_000_000_500);
+  assert.deepEqual(recovered.messages[0].metrics.usage, { total_tokens: 4 });
 });
 
 test('blocked localStorage restoration still completes the mount effect', async () => {

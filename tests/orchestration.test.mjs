@@ -15,10 +15,20 @@ const moduleUrl = (source) =>
   ).toString('base64');
 const read = (path) => readFile(new URL(path, import.meta.url), 'utf8');
 const requestUrl = moduleUrl(await read('../lib/chat-request.ts'));
+const streamUrl = moduleUrl(await read('../lib/chat-stream.ts'));
+const metricsUrl = moduleUrl(
+  (await read('../lib/chat-metrics.ts'))
+    .replace('./chat-request', requestUrl)
+    .replace('./chat-stream', streamUrl),
+);
 const expertsUrl = moduleUrl(
   (await read('../lib/experts.ts')).replace('./chat-request', requestUrl),
 );
-const streamUrl = moduleUrl(await read('../lib/chat-stream.ts'));
+const agentUrl = moduleUrl(
+  (await read('../lib/agent.ts'))
+    .replace('./chat-request', requestUrl)
+    .replace('./chat-stream', streamUrl),
+);
 const { EXPERT_ROLES, synthesisMessages } = await import(expertsUrl);
 
 // Minimal hook host: run the production hook and transport without a DOM or a paid API call.
@@ -33,10 +43,12 @@ export function useEffect() {}
 `);
 const hookSource = (await read('../hooks/use-chat.ts'))
   .replace('react', reactUrl)
+  .replace('@/lib/agent', agentUrl)
   .replace('@/lib/chat-request', requestUrl)
   .replace('@/lib/chat-stream', streamUrl)
-  .replace('@/lib/experts', expertsUrl);
-const { useChat } = await import(moduleUrl(hookSource));
+  .replace('@/lib/experts', expertsUrl)
+  .replace('@/lib/chat-metrics', metricsUrl);
+const { AcceptedChatError, recoverSession, restoreStore, useChat } = await import(moduleUrl(hookSource));
 const host = await import(reactUrl);
 const render = () => {
   host.begin();
@@ -260,4 +272,72 @@ test('Liquid is used for every expert and synthesis; repeat can switch to DeepSe
   assert.equal(calls[7].body.settings.model, 'deepseek-v4-flash');
   calls[7].resolve(response('Новый итог'));
   await repeated;
+});
+
+test('new chats receive isolated Agents, history and settings', async () => {
+  const calls = setup();
+  const firstChat = render();
+  firstChat.setSettings({ ...firstChat.settings, model: 'deepseek-v4-pro', systemPrompt: 'Первый агент' });
+  const first = render().send('Контекст первого чата');
+  calls[0].resolve(response('Ответ первого агента'));
+  await first;
+  const firstId = render().activeSessionId;
+
+  render().newChat();
+  let secondChat = render();
+  const secondId = secondChat.activeSessionId;
+  assert.notEqual(secondId, firstId);
+  secondChat.setSettings({ ...secondChat.settings, model: 'liquid/lfm-2.5-2.6b:free', systemPrompt: 'Второй агент' });
+  const second = render().send('Контекст второго чата');
+  assert.equal(calls[1].body.settings.model, 'liquid/lfm-2.5-2.6b:free');
+  assert.ok(!calls[1].body.messages.some((message) => message.content.includes('первого')));
+  calls[1].resolve(response('Ответ второго агента'));
+  await second;
+
+  render().setActiveSession(firstId);
+  secondChat = render();
+  assert.equal(secondChat.settings.model, 'deepseek-v4-pro');
+  assert.equal(secondChat.messages.at(-1).content, 'Ответ первого агента');
+  assert.equal(secondChat.sessions.length, 2);
+});
+
+test('storage recovery keeps valid session data and drops malformed nested fields', () => {
+  const stored = JSON.stringify({
+    activeSessionId: 'saved',
+    sessions: [{
+      id: 'saved', title: 'Сохранённый', updatedAt: Date.now(),
+      agent: { id: 'agent', name: 'Агент', settings: { model: 'deepseek-v4-pro', temperature: 'bad' } },
+      messages: [
+        { id: 'm1', role: 'user', content: 'Целое сообщение' },
+        { id: 'bad', role: 'system', content: 'Нельзя' },
+      ],
+      runs: [{ id: 'bad-run', topic: 'x', dataset: '', experts: [] }],
+      requestJson: 'bad json',
+      lastRequest: { prompt: 'broken', messages: [] },
+      draft: 1,
+    }, { id: 1 }],
+  });
+  const restored = restoreStore(stored);
+  assert.equal(restored.sessions.length, 1);
+  assert.equal(restored.activeSessionId, 'saved');
+  assert.equal(restored.sessions[0].agent.settings.model, 'deepseek-v4-pro');
+  assert.equal(restored.sessions[0].agent.settings.temperature, null);
+  assert.equal(restored.sessions[0].messages.length, 1);
+  assert.equal(restored.sessions[0].runs.length, 0);
+  assert.equal(restored.sessions[0].requestJson, null);
+  assert.equal(restored.sessions[0].lastRequest, null);
+  assert.equal(restored.sessions[0].draft, '');
+  assert.equal(recoverSession({ id: 'broken' }), null);
+});
+
+test('an accepted stopped request exposes a localized error without asking the page to restore its draft', async () => {
+  const calls = setup();
+  const pending = render().send('Не дублируй меня');
+  render().stop();
+  await assert.rejects(pending, AcceptedChatError);
+  const chat = render();
+  assert.equal(chat.draft, '');
+  assert.equal(chat.error, 'Запрос остановлен. Частичные ответы сохранены.');
+  assert.equal(chat.messages.filter((message) => message.content === 'Не дублируй меня').length, 1);
+  assert.equal(calls.length, 1);
 });

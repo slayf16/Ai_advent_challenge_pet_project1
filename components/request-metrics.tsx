@@ -4,7 +4,6 @@ import { useEffect, useState } from 'react';
 import { MODELS } from '@/lib/chat-request';
 import {
   aggregateMetrics,
-  pricingForModel,
   metricsSnapshot,
   type CostEstimate,
   type RequestMetrics,
@@ -35,7 +34,8 @@ function useClock(live: boolean) {
   return clock;
 }
 
-const formatDuration = (milliseconds: number) => {
+const formatDuration = (milliseconds: number | null) => {
+  if (milliseconds === null) return 'Нет данных';
   if (milliseconds < 1000) return `${Math.round(milliseconds)} мс`;
   return `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 2 : 1)} с`;
 };
@@ -52,8 +52,10 @@ function formatCost(cost: CostEstimate) {
     : `${formatUsd(cost.minimumUsd)}–${formatUsd(cost.maximumUsd)}`;
 }
 
-const tokenValue = (value: number | undefined) =>
-  value === undefined ? 'Нет данных' : value.toLocaleString('ru-RU');
+const tokenValue = (value: unknown) =>
+  typeof value === 'number' && Number.isFinite(value)
+    ? value.toLocaleString('ru-RU')
+    : 'Нет данных';
 
 export function RequestMetricsView({
   metrics,
@@ -65,7 +67,11 @@ export function RequestMetricsView({
   const clock = useClock(metrics.status === 'running');
   const snapshot = metricsSnapshot(metrics, clock.performanceMs, clock.epochMs);
   const usage = metrics.usage;
-  const pricing = pricingForModel(metrics.model);
+  const pricing = snapshot.cost?.snapshot ?? metrics.pricingSnapshot;
+  const pricingLabel = pricing
+    ? (MODELS.find((model) => model.id === pricing.model)?.name ??
+      pricing.model)
+    : 'Нет данных';
   const isTerminal = metrics.status !== 'running';
 
   return (
@@ -81,13 +87,7 @@ export function RequestMetricsView({
       </div>
 
       <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
-        <Metric
-          label="Модель"
-          value={
-            MODELS.find((model) => model.id === pricing.model)?.name ??
-            pricing.model
-          }
-        />
+        <Metric label="Модель" value={pricingLabel} />
         <Metric label="Время" value={formatDuration(snapshot.durationMs)} />
         <Metric
           label="До первого токена"
@@ -111,29 +111,19 @@ export function RequestMetricsView({
               : `${snapshot.averageTokensPerSecond.toFixed(1)} токен/с`
           }
         />
-        <Metric
-          label="Стоимость"
-          value={
-            snapshot.cost
-              ? formatCost(snapshot.cost)
-              : usage
-                ? 'Недоступно'
-                : isTerminal
-                  ? 'Нет данных'
-                  : 'Ожидание usage…'
-          }
-        />
-        <Metric
-          label="Всего токенов"
-          value={
-            usage?.total_tokens === undefined
-              ? isTerminal
-                ? 'Нет данных'
-                : 'Ожидание usage…'
-              : tokenValue(usage.total_tokens)
-          }
-        />
       </dl>
+
+      {usage?.completion_tokens !== undefined && (
+        <p className="mt-3 text-sm font-medium">
+          Выход модели: {tokenValue(usage.completion_tokens)} токенов · выход {pricing ? formatUsd(usage.completion_tokens * pricing.output / pricing.unitTokens) : 'стоимость неизвестна'}
+          {typeof usage.completion_tokens_details?.reasoning_tokens === 'number' && usage.completion_tokens_details.reasoning_tokens <= usage.completion_tokens && ` · Ответ: ${tokenValue(usage.completion_tokens - usage.completion_tokens_details.reasoning_tokens)} · Рассуждения: ${tokenValue(usage.completion_tokens_details.reasoning_tokens)}`}
+        </p>
+      )}
+      {isTerminal && !usage && (
+        <p className="mt-3 text-sm font-medium">
+          API не передал статистику.
+        </p>
+      )}
 
       <p className="mt-3 text-xs leading-5 text-muted-foreground">
         Скорость — выходные токены за полное время запроса; это включает
@@ -168,9 +158,9 @@ export function RequestMetricsView({
               />
               <Metric label="Всего" value={tokenValue(usage.total_tokens)} />
             </dl>
-            {snapshot.cost && (
+            {snapshot.cost && pricing && (
               <div className="space-y-1 border-t border-white/8 pt-3 text-xs leading-5">
-                {pricing.model === 'liquid/lfm-2.5-2.6b:free' ? (
+                {pricing?.model === 'liquid/lfm-2.5-2.6b:free' ? (
                   <p>
                     Бесплатная модель OpenRouter: $0 за входные и выходные
                     токены. Действуют лимиты запросов.
@@ -179,24 +169,9 @@ export function RequestMetricsView({
                   <p>
                     Тариф:{' '}
                     {snapshot.cost.tier === 'peak' ? 'пиковый' : 'внепиковый'}.
-                    Cache hit × $
-                    {
-                      pricing[
-                        snapshot.cost.tier === 'peak' ? 'peak' : 'offPeak'
-                      ].cacheHitInput
-                    }
-                    /1M + cache miss × $
-                    {
-                      pricing[
-                        snapshot.cost.tier === 'peak' ? 'peak' : 'offPeak'
-                      ].cacheMissInput
-                    }
-                    /1M + output × $
-                    {
-                      pricing[
-                        snapshot.cost.tier === 'peak' ? 'peak' : 'offPeak'
-                      ].output
-                    }
+                    Cache hit × ${pricing.cacheHitInput}
+                    /1M + cache miss × ${pricing.cacheMissInput}
+                    /1M + output × ${pricing.output}
                     /1M.
                   </p>
                 )}
@@ -206,6 +181,7 @@ export function RequestMetricsView({
                     полного попадания до полного промаха кеша.
                   </p>
                 )}
+                <p>Полная стоимость запроса: {formatCost(snapshot.cost)}.</p>
                 <p>
                   Тариф проверен {pricing.verifiedAt}.{' '}
                   <a
@@ -217,6 +193,12 @@ export function RequestMetricsView({
                     Тариф модели
                   </a>
                 </p>
+                {pricing.legacyInferred && (
+                  <p>
+                    Тариф восстановлен из сохранённых модели и времени;
+                    историческая цена условна.
+                  </p>
+                )}
               </div>
             )}
           </div>
@@ -230,6 +212,16 @@ export function RequestMetricsView({
       </details>
     </section>
   );
+}
+
+export function UserInputMetrics({ metrics }: { metrics: RequestMetrics }) {
+  const usage = metrics.usage;
+  const rates = metrics.pricingSnapshot;
+  if (usage?.prompt_tokens === undefined) return <p className="mt-2 text-xs text-primary-foreground/80">{metrics.status === 'running' ? 'Ожидание статистики API…' : 'API не передал статистику'}</p>;
+  const prompt = usage.prompt_tokens;
+  const hit = usage.prompt_cache_hit_tokens, miss = usage.prompt_cache_miss_tokens;
+  const cost = !rates ? 'стоимость неизвестна' : Number.isInteger(hit) && Number.isInteger(miss) && hit! + miss! === prompt ? formatUsd((hit! * rates.cacheHitInput + miss! * rates.cacheMissInput) / rates.unitTokens) : `${formatUsd(prompt * rates.cacheHitInput / rates.unitTokens)}–${formatUsd(prompt * rates.cacheMissInput / rates.unitTokens)}`;
+  return <p className="mt-2 text-xs text-primary-foreground/80">Вход запроса: {tokenValue(prompt)} токенов · {cost}. Всё, что отправлено модели: ваше сообщение, история и инструкции.</p>;
 }
 
 export function AggregateMetricsView({
@@ -252,7 +244,8 @@ export function AggregateMetricsView({
   const cost =
     aggregate.minimumCostUsd === null || aggregate.maximumCostUsd === null
       ? 'Ожидание usage…'
-      : aggregate.exactCost
+      : aggregate.exactCost ||
+          aggregate.minimumCostUsd === aggregate.maximumCostUsd
         ? formatUsd(aggregate.minimumCostUsd)
         : `${formatUsd(aggregate.minimumCostUsd)}–${formatUsd(aggregate.maximumCostUsd)}`;
   const resolvedCost =
@@ -270,16 +263,16 @@ export function AggregateMetricsView({
           value={formatDuration(aggregate.wallTimeMs)}
         />
         <Metric
-          label="Токены"
+          label="API: вход / выход / всего"
           value={
             aggregate.usage
-              ? tokenValue(aggregate.usage.total_tokens)
+              ? `${tokenValue(aggregate.usage.prompt_tokens)} / ${tokenValue(aggregate.usage.completion_tokens)} / ${tokenValue(aggregate.usage.total_tokens)}`
               : live
                 ? 'Ожидание…'
                 : 'Нет данных'
           }
         />
-        <Metric label="Стоимость" value={resolvedCost} />
+        <Metric label="Расход API" value={resolvedCost} />
         <Metric
           label="Получено usage"
           value={`${aggregate.usageCount} из ${aggregate.totalCount}`}
@@ -289,12 +282,14 @@ export function AggregateMetricsView({
         Общее время — от старта первого до завершения последнего запроса;
         параллельные интервалы не суммируются. Для метрик всего диалога это
         время включает паузы между запросами.
-        {aggregate.isPartial &&
-          ' Токены и стоимость пока частичные: учтены только ответы с финальным usage.'}
+        {aggregate.usageCount < aggregate.totalCount && ` Частичный расход: данные получены для ${aggregate.usageCount} из ${aggregate.totalCount} запросов.`}
+        {aggregate.costCount < aggregate.usageCount && ` Тариф известен для ${aggregate.costCount} из ${aggregate.usageCount} запросов с usage.`}
+        {' Сумма всех запросов, включая повторы и экспертов. Повторная передача истории учитывается заново.'}
       </p>
     </section>
   );
 }
+
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (

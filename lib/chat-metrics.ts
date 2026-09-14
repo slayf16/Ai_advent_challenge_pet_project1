@@ -1,16 +1,29 @@
-import type { ChatModel } from './chat-request';
+import { MODELS, type ChatModel } from './chat-request';
 import type { TokenUsage } from './chat-stream';
 
+export type PricingTier = 'off-peak' | 'peak';
+export type PricingSnapshot = {
+  model: ChatModel;
+  tier: PricingTier;
+  currency: 'USD';
+  unitTokens: 1_000_000;
+  cacheHitInput: number;
+  cacheMissInput: number;
+  output: number;
+  verifiedAt: string;
+  sourceUrl: string;
+  legacyInferred?: true;
+};
 export type RequestMetrics = {
+  requestId?: string;
   model?: ChatModel;
+  pricingSnapshot?: PricingSnapshot;
   startedAt: number;
   firstTokenAt: number | null;
   endedAt: number | null;
   usage: TokenUsage | null;
   status: 'running' | 'complete' | 'error' | 'cancelled';
 };
-
-export type PricingTier = 'off-peak' | 'peak';
 
 export const DEEPSEEK_V4_FLASH_PRICING = {
   model: 'deepseek-v4-flash',
@@ -21,7 +34,6 @@ export const DEEPSEEK_V4_FLASH_PRICING = {
   offPeak: { cacheHitInput: 0.007, cacheMissInput: 0.22, output: 0.66 },
   peak: { cacheHitInput: 0.014, cacheMissInput: 0.44, output: 1.32 },
 } as const;
-
 export const DEEPSEEK_V4_PRO_PRICING = {
   ...DEEPSEEK_V4_FLASH_PRICING,
   model: 'deepseek-v4-pro',
@@ -41,7 +53,102 @@ export const pricingForModel = (model?: ChatModel) =>
     : model === 'deepseek-v4-pro'
       ? DEEPSEEK_V4_PRO_PRICING
       : DEEPSEEK_V4_FLASH_PRICING;
-
+export function pricingTierAt(epochMs: number): PricingTier {
+  const d = new Date(epochMs);
+  if (d.getUTCDay() === 0 || d.getUTCDay() === 6) return 'off-peak';
+  const m = d.getUTCHours() * 60 + d.getUTCMinutes();
+  return (m >= 60 && m < 240) || (m >= 360 && m < 600) ? 'peak' : 'off-peak';
+}
+export function pricingSnapshotForModel(
+  model: ChatModel,
+  startedAt: number,
+  legacyInferred = false,
+): PricingSnapshot {
+  const table = pricingForModel(model);
+  const tier = pricingTierAt(startedAt);
+  const rates = table[tier === 'peak' ? 'peak' : 'offPeak'];
+  return {
+    model,
+    tier,
+    currency: 'USD',
+    unitTokens: 1_000_000,
+    ...rates,
+    verifiedAt: table.verifiedAt,
+    sourceUrl: table.sourceUrl,
+    ...(legacyInferred ? { legacyInferred: true as const } : {}),
+  };
+}
+const validModel = (value: unknown): value is ChatModel =>
+  typeof value === 'string' && MODELS.some((model) => model.id === value);
+const validUrl = (value: unknown) => {
+  if (typeof value !== 'string') return false;
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+export const normalizePricingSnapshot = (
+  value: unknown,
+): PricingSnapshot | undefined => {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    return undefined;
+  const v = value as Record<string, unknown>;
+  const rates = ['cacheHitInput', 'cacheMissInput', 'output'];
+  if (
+    !validModel(v.model) ||
+    (v.tier !== 'peak' && v.tier !== 'off-peak') ||
+    v.currency !== 'USD' ||
+    v.unitTokens !== 1_000_000 ||
+    !rates.every(
+      (key) =>
+        typeof v[key] === 'number' && Number.isFinite(v[key]) && v[key] >= 0,
+    ) ||
+    Number(v.cacheHitInput) > Number(v.cacheMissInput) ||
+    typeof v.verifiedAt !== 'string' ||
+    !Number.isFinite(Date.parse(v.verifiedAt)) ||
+    !validUrl(v.sourceUrl) ||
+    (v.legacyInferred !== undefined && v.legacyInferred !== true)
+  )
+    return undefined;
+  return {
+    model: v.model,
+    tier: v.tier,
+    currency: 'USD',
+    unitTokens: 1_000_000,
+    cacheHitInput: v.cacheHitInput as number,
+    cacheMissInput: v.cacheMissInput as number,
+    output: v.output as number,
+    verifiedAt: v.verifiedAt,
+    sourceUrl: v.sourceUrl as string,
+    ...(v.legacyInferred === true ? { legacyInferred: true } : {}),
+  };
+};
+const nonNegative = (v: number | undefined) =>
+  Number.isFinite(v) && v! >= 0 ? v! : 0;
+const hasUsage = (
+  u: TokenUsage | null,
+): u is TokenUsage & {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+} =>
+  !!u &&
+  [u.prompt_tokens, u.completion_tokens, u.total_tokens].every(
+    (v) => Number.isInteger(v) && v! >= 0,
+  ) &&
+  u.total_tokens === u.prompt_tokens! + u.completion_tokens!;
+function cacheBreakdown(usage: TokenUsage) {
+  const hit = usage.prompt_cache_hit_tokens,
+    miss = usage.prompt_cache_miss_tokens;
+  return Number.isInteger(hit) &&
+    hit! >= 0 &&
+    Number.isInteger(miss) &&
+    miss! >= 0 &&
+    hit! + miss! === usage.prompt_tokens
+    ? { hit: hit!, miss: miss! }
+    : null;
+}
 export type CostEstimate = {
   exact: boolean;
   minimumUsd: number;
@@ -50,88 +157,37 @@ export type CostEstimate = {
   cacheMissInputUsd: number | null;
   outputUsd: number;
   tier: PricingTier;
+  snapshot: PricingSnapshot;
 };
-
-export type MetricsSnapshot = {
-  durationMs: number;
-  ttftMs: number | null;
-  averageTokensPerSecond: number | null;
-  cost: CostEstimate | null;
-};
-
-export type AggregateMetrics = {
-  wallTimeMs: number;
-  usage: TokenUsage | null;
-  usageCount: number;
-  totalCount: number;
-  isPartial: boolean;
-  minimumCostUsd: number | null;
-  maximumCostUsd: number | null;
-  exactCost: boolean;
-};
-
-const nonNegative = (value: number | undefined) =>
-  Number.isFinite(value) && value! >= 0 ? value! : 0;
-
-const hasCoreUsage = (
-  usage: TokenUsage | null,
-): usage is TokenUsage & {
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-} =>
-  usage !== null &&
-  Number.isInteger(usage.prompt_tokens) &&
-  usage.prompt_tokens! >= 0 &&
-  Number.isInteger(usage.completion_tokens) &&
-  usage.completion_tokens! >= 0 &&
-  Number.isInteger(usage.total_tokens) &&
-  usage.total_tokens! >= 0;
-
-export function requestEpochMs(
-  startedAt: number,
-  nowPerformanceMs: number,
-  nowEpochMs: number,
-) {
-  return nowEpochMs - nowPerformanceMs + startedAt;
-}
-
-export function pricingTierAt(epochMs: number): PricingTier {
-  const date = new Date(epochMs);
-  if (date.getUTCDay() === 0 || date.getUTCDay() === 6) return 'off-peak';
-  const minutes = date.getUTCHours() * 60 + date.getUTCMinutes();
-  const isPeak =
-    (minutes >= 60 && minutes < 240) || (minutes >= 360 && minutes < 600);
-  return isPeak ? 'peak' : 'off-peak';
-}
-
-function cacheBreakdown(usage: TokenUsage) {
-  const prompt = nonNegative(usage.prompt_tokens);
-  const suppliedHit = usage.prompt_cache_hit_tokens;
-  const suppliedMiss = usage.prompt_cache_miss_tokens;
-  if (
-    !Number.isInteger(suppliedHit) ||
-    suppliedHit! < 0 ||
-    !Number.isInteger(suppliedMiss) ||
-    suppliedMiss! < 0 ||
-    suppliedHit! + suppliedMiss! !== prompt
-  ) {
-    return null;
-  }
-  return { hit: suppliedHit!, miss: suppliedMiss! };
-}
-
 export function calculateCost(
   usage: TokenUsage | null,
-  tier: PricingTier,
+  snapshotOrTier: PricingSnapshot | PricingTier,
   model?: ChatModel,
 ): CostEstimate | null {
-  if (!hasCoreUsage(usage)) return null;
-  const rates = pricingForModel(model)[tier === 'peak' ? 'peak' : 'offPeak'];
-  const unit = DEEPSEEK_V4_FLASH_PRICING.unitTokens;
+  if (!hasUsage(usage)) return null;
+  const snapshot =
+    typeof snapshotOrTier === 'string'
+      ? (() => {
+          const table = pricingForModel(model);
+          const rates = table[snapshotOrTier === 'peak' ? 'peak' : 'offPeak'];
+          return {
+            model: model ?? 'deepseek-v4-flash',
+            tier: snapshotOrTier,
+            currency: 'USD' as const,
+            unitTokens: 1_000_000 as const,
+            ...rates,
+            verifiedAt: table.verifiedAt,
+            sourceUrl: table.sourceUrl,
+          };
+        })()
+      : snapshotOrTier;
   const outputUsd =
-    (nonNegative(usage.completion_tokens) * rates.output) / unit;
-  if (model === 'liquid/lfm-2.5-2.6b:free') {
+    (usage.completion_tokens * snapshot.output) / snapshot.unitTokens;
+  if (
+    snapshot.cacheHitInput === 0 &&
+    snapshot.cacheMissInput === 0 &&
+    snapshot.output === 0
+  )
     return {
       exact: true,
       minimumUsd: 0,
@@ -139,27 +195,30 @@ export function calculateCost(
       cacheHitInputUsd: 0,
       cacheMissInputUsd: 0,
       outputUsd: 0,
-      tier: 'off-peak',
+      tier: snapshot.tier,
+      snapshot,
     };
-  }
   const cache = cacheBreakdown(usage);
-
-  if (!cache) {
-    const prompt = nonNegative(usage.prompt_tokens);
+  if (!cache)
     return {
       exact: false,
-      minimumUsd: outputUsd + (prompt * rates.cacheHitInput) / unit,
-      maximumUsd: outputUsd + (prompt * rates.cacheMissInput) / unit,
+      minimumUsd:
+        outputUsd +
+        (usage.prompt_tokens * snapshot.cacheHitInput) / snapshot.unitTokens,
+      maximumUsd:
+        outputUsd +
+        (usage.prompt_tokens * snapshot.cacheMissInput) / snapshot.unitTokens,
       cacheHitInputUsd: null,
       cacheMissInputUsd: null,
       outputUsd,
-      tier,
+      tier: snapshot.tier,
+      snapshot,
     };
-  }
-
-  const cacheHitInputUsd = (cache.hit * rates.cacheHitInput) / unit;
-  const cacheMissInputUsd = (cache.miss * rates.cacheMissInput) / unit;
-  const total = cacheHitInputUsd + cacheMissInputUsd + outputUsd;
+  const cacheHitInputUsd =
+      (cache.hit * snapshot.cacheHitInput) / snapshot.unitTokens,
+    cacheMissInputUsd =
+      (cache.miss * snapshot.cacheMissInput) / snapshot.unitTokens,
+    total = cacheHitInputUsd + cacheMissInputUsd + outputUsd;
   return {
     exact: true,
     minimumUsd: total,
@@ -167,82 +226,107 @@ export function calculateCost(
     cacheHitInputUsd,
     cacheMissInputUsd,
     outputUsd,
-    tier,
+    tier: snapshot.tier,
+    snapshot,
   };
 }
-
-export function metricsSnapshot(
-  metrics: RequestMetrics,
+export function requestEpochMs(
+  startedAt: number,
   nowPerformanceMs: number,
   nowEpochMs: number,
+) {
+  return nowEpochMs - nowPerformanceMs + startedAt;
+}
+export type MetricsSnapshot = {
+  durationMs: number | null;
+  ttftMs: number | null;
+  averageTokensPerSecond: number | null;
+  cost: CostEstimate | null;
+};
+const snapshotForMetrics = (m: RequestMetrics) => m.pricingSnapshot;
+export function metricsSnapshot(
+  metrics: RequestMetrics,
+  performance: number,
+  epoch: number,
 ): MetricsSnapshot {
-  const end = metrics.endedAt ?? nowPerformanceMs;
-  const durationMs = Math.max(0, end - metrics.startedAt);
-  const ttftMs =
-    metrics.firstTokenAt === null
-      ? null
-      : Math.max(0, metrics.firstTokenAt - metrics.startedAt);
-  const completionTokens = metrics.usage?.completion_tokens;
-  const averageTokensPerSecond =
-    completionTokens !== undefined && durationMs > 0
-      ? completionTokens / (durationMs / 1000)
-      : null;
-  const tier = pricingTierAt(
-    requestEpochMs(metrics.startedAt, nowPerformanceMs, nowEpochMs),
-  );
+  const epochClock = metrics.startedAt > 10_000_000_000,
+    current = epochClock ? epoch : performance,
+    durationMs = metrics.endedAt === null && metrics.status !== 'running' ? null : Math.max(0, (metrics.endedAt ?? current) - metrics.startedAt),
+    ttftMs =
+      metrics.firstTokenAt === null
+        ? null
+        : Math.max(0, metrics.firstTokenAt - metrics.startedAt);
+  const pricingSnapshot = snapshotForMetrics(metrics);
   return {
     durationMs,
     ttftMs,
-    averageTokensPerSecond,
-    cost: calculateCost(metrics.usage, tier, metrics.model),
+    averageTokensPerSecond:
+      hasUsage(metrics.usage) && durationMs !== null && durationMs > 0
+        ? metrics.usage.completion_tokens / (durationMs / 1000)
+        : null,
+    cost: pricingSnapshot
+      ? calculateCost(metrics.usage, pricingSnapshot)
+      : null,
   };
 }
-
+export type AggregateMetrics = {
+  wallTimeMs: number;
+  usage: TokenUsage | null;
+  usageCount: number;
+  costCount: number;
+  totalCount: number;
+  isPartial: boolean;
+  minimumCostUsd: number | null;
+  maximumCostUsd: number | null;
+  exactCost: boolean;
+};
 export function aggregateMetrics(
   metrics: RequestMetrics[],
-  nowPerformanceMs: number,
-  nowEpochMs: number,
+  performance: number,
+  epoch: number,
 ): AggregateMetrics {
-  if (metrics.length === 0) {
+  if (!metrics.length)
     return {
       wallTimeMs: 0,
       usage: null,
       usageCount: 0,
+      costCount: 0,
       totalCount: 0,
       isPartial: false,
       minimumCostUsd: null,
       maximumCostUsd: null,
       exactCost: false,
     };
-  }
-
-  const startedAt = Math.min(...metrics.map((item) => item.startedAt));
-  const endedAt = Math.max(
-    ...metrics.map((item) => item.endedAt ?? nowPerformanceMs),
-  );
+  const intervals = metrics.map((m) => {
+    const toEpoch = (v: number) =>
+      m.startedAt > 10_000_000_000 ? v : requestEpochMs(v, performance, epoch);
+    return {
+      start: toEpoch(m.startedAt),
+      end: toEpoch(
+        m.endedAt ?? (m.startedAt > 10_000_000_000 ? epoch : performance),
+      ),
+    };
+  });
   const known = metrics.filter(
     (
-      item,
-    ): item is RequestMetrics & {
+      m,
+    ): m is RequestMetrics & {
       usage: TokenUsage & {
         prompt_tokens: number;
         completion_tokens: number;
         total_tokens: number;
       };
-    } => hasCoreUsage(item.usage),
+    } => hasUsage(m.usage),
   );
   const usage = known.length
     ? known.reduce<TokenUsage>(
         (total, item) => ({
           prompt_tokens:
-            nonNegative(total.prompt_tokens) +
-            nonNegative(item.usage.prompt_tokens),
+            nonNegative(total.prompt_tokens) + item.usage.prompt_tokens,
           completion_tokens:
-            nonNegative(total.completion_tokens) +
-            nonNegative(item.usage.completion_tokens),
+            nonNegative(total.completion_tokens) + item.usage.completion_tokens,
           total_tokens:
-            nonNegative(total.total_tokens) +
-            nonNegative(item.usage.total_tokens),
+            nonNegative(total.total_tokens) + item.usage.total_tokens,
           prompt_cache_hit_tokens:
             nonNegative(total.prompt_cache_hit_tokens) +
             nonNegative(item.usage.prompt_cache_hit_tokens),
@@ -257,30 +341,29 @@ export function aggregateMetrics(
               ),
           },
         }),
-        {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0,
-        },
+        {},
       )
     : null;
-  const costs = known.map(
-    (item) => metricsSnapshot(item, nowPerformanceMs, nowEpochMs).cost!,
-  );
-
+  const costs = known
+    .map((m) => metricsSnapshot(m, performance, epoch).cost)
+    .filter((cost): cost is CostEstimate => cost !== null);
   return {
-    wallTimeMs: Math.max(0, endedAt - startedAt),
+    wallTimeMs: Math.max(
+      0,
+      Math.max(...intervals.map((i) => i.end)) -
+        Math.min(...intervals.map((i) => i.start)),
+    ),
     usage,
     usageCount: known.length,
+    costCount: costs.length,
     totalCount: metrics.length,
-    isPartial: known.length !== metrics.length,
+    isPartial: known.length !== metrics.length || costs.length !== known.length,
     minimumCostUsd: costs.length
-      ? costs.reduce((sum, cost) => sum + cost.minimumUsd, 0)
+      ? costs.reduce((s, c) => s + c.minimumUsd, 0)
       : null,
     maximumCostUsd: costs.length
-      ? costs.reduce((sum, cost) => sum + cost.maximumUsd, 0)
+      ? costs.reduce((s, c) => s + c.maximumUsd, 0)
       : null,
-    exactCost:
-      costs.length === metrics.length && costs.every((cost) => cost.exact),
+    exactCost: costs.length === metrics.length && costs.every((c) => c.exact),
   };
 }

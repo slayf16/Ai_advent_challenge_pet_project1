@@ -3,10 +3,18 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import ts from 'typescript';
 
-const source = await readFile(
-  new URL('../lib/chat-metrics.ts', import.meta.url),
+const requestSource = await readFile(
+  new URL('../lib/chat-request.ts', import.meta.url),
   'utf8',
 );
+const requestCompiled = ts.transpileModule(requestSource, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText;
+const requestUrl = `data:text/javascript;base64,${Buffer.from(requestCompiled).toString('base64')}`;
+const source = (await readFile(
+  new URL('../lib/chat-metrics.ts', import.meta.url),
+  'utf8',
+)).replace('./chat-request', requestUrl);
 const compiled = ts.transpileModule(source, {
   compilerOptions: {
     module: ts.ModuleKind.ESNext,
@@ -22,8 +30,23 @@ const {
   calculateCost,
   DEEPSEEK_V4_FLASH_PRICING,
   metricsSnapshot,
+  normalizePricingSnapshot,
+  pricingSnapshotForModel,
   pricingTierAt,
 } = metricsModule;
+
+test('usage without a saved price snapshot remains an unknown cost', () => {
+  const snapshot = metricsSnapshot({ startedAt: 100, endedAt: 200, firstTokenAt: null, status: 'complete', usage: { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200 } }, 300, Date.now());
+  assert.equal(snapshot.cost, null);
+  const aggregate = aggregateMetrics([{ startedAt: 100, endedAt: 200, firstTokenAt: null, status: 'complete', usage: { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200 } }], 300, Date.now());
+  assert.equal(aggregate.usageCount, 1);
+  assert.equal(aggregate.costCount, 0);
+  assert.equal(aggregate.isPartial, true);
+});
+
+test('pricing snapshot normalization rejects unsafe persisted values', () => {
+  assert.equal(normalizePricingSnapshot({ model: 'not-a-model', tier: 'peak', currency: 'USD', unitTokens: 1_000_000, cacheHitInput: -50, cacheMissInput: 1, output: 1, verifiedAt: '2026-09-06', sourceUrl: 'https://example.com' }), undefined);
+});
 
 test('official V4 Flash rates and UTC peak windows are represented exactly', () => {
   assert.deepEqual(DEEPSEEK_V4_FLASH_PRICING.offPeak, {
@@ -120,6 +143,7 @@ test('aggregate uses wall time and marks totals partial when any usage is missin
   const result = aggregateMetrics(
     [
       {
+        pricingSnapshot: pricingSnapshotForModel('deepseek-v4-flash', Date.UTC(2026, 8, 4, 12)),
         startedAt: 100,
         firstTokenAt: 200,
         endedAt: 500,
@@ -183,7 +207,7 @@ test('weekends remain off-peak and Pro uses its own tariff in mixed history', ()
   assert.equal(calculateCost(usage, 'peak', 'deepseek-v4-pro').minimumUsd, pro.minimumUsd * 2);
   const metrics = { startedAt: 0, endedAt: 100, firstTokenAt: 10, status: 'complete', usage };
   const result = aggregateMetrics([
-    { ...metrics, model: 'deepseek-v4-flash' }, { ...metrics, model: 'deepseek-v4-pro' },
+    { ...metrics, model: 'deepseek-v4-flash', pricingSnapshot: pricingSnapshotForModel('deepseek-v4-flash', Date.UTC(2026, 8, 6, 12)) }, { ...metrics, model: 'deepseek-v4-pro', pricingSnapshot: pricingSnapshotForModel('deepseek-v4-pro', Date.UTC(2026, 8, 6, 12)) },
   ], 100, Date.UTC(2026, 8, 6, 12));
   assert.ok(Math.abs(result.minimumCostUsd - (0.0002668 + 0.0008008)) < 1e-12);
 });
@@ -195,9 +219,19 @@ test('free Liquid is exactly zero without cache counters and mixed totals keep p
   assert.equal(cost.minimumUsd, 0);
   assert.equal(cost.maximumUsd, 0);
   const metrics = { startedAt: 0, endedAt: 100, firstTokenAt: 10, status: 'complete', usage };
-  const mixed = aggregateMetrics([{ ...metrics, model: 'liquid/lfm-2.5-2.6b:free' },
-    { ...metrics, model: 'deepseek-v4-pro' }], 100, Date.UTC(2026, 8, 6, 12));
+  const mixed = aggregateMetrics([{ ...metrics, model: 'liquid/lfm-2.5-2.6b:free', pricingSnapshot: pricingSnapshotForModel('liquid/lfm-2.5-2.6b:free', Date.UTC(2026, 8, 6, 12)) },
+    { ...metrics, model: 'deepseek-v4-pro', pricingSnapshot: pricingSnapshotForModel('deepseek-v4-pro', Date.UTC(2026, 8, 6, 12)) }], 100, Date.UTC(2026, 8, 6, 12));
   assert.equal(mixed.minimumCostUsd, calculateCost(usage, 'off-peak', 'deepseek-v4-pro').minimumUsd);
   assert.equal(mixed.usage.total_tokens, 2400);
   assert.equal(calculateCost(null, 'off-peak', 'liquid/lfm-2.5-2.6b:free'), null);
+});
+
+test('mixed legacy performance and persisted epoch clocks use normalized wall time', () => {
+  const nowPerformance = 500;
+  const nowEpoch = 1_700_000_000_500;
+  const result = aggregateMetrics([
+    { startedAt: 100, endedAt: 300, firstTokenAt: null, usage: null, status: 'complete' },
+    { startedAt: 1_700_000_000_200, endedAt: 1_700_000_000_400, firstTokenAt: null, usage: null, status: 'complete' },
+  ], nowPerformance, nowEpoch);
+  assert.equal(result.wallTimeMs, 300);
 });
