@@ -16,6 +16,7 @@ import {
   settingsError,
   type ResponseSettings,
 } from '@/lib/chat-request';
+import type { ContextStrategy } from '@/hooks/use-chat';
 
 type Props = {
   agentName: string;
@@ -26,6 +27,8 @@ type Props = {
   canRepeat: boolean;
   onRepeat: () => void;
   requestJson: string | null;
+  contextStrategy: ContextStrategy;
+  onContextStrategyChange: (value: ContextStrategy) => void;
 };
 
 const prettyJson = (value: string) => {
@@ -45,6 +48,8 @@ export function ResponseSettingsPanel({
   canRepeat,
   onRepeat,
   requestJson,
+  contextStrategy,
+  onContextStrategyChange,
 }: Props) {
   const invalid = settingsError(settings);
 
@@ -93,6 +98,14 @@ export function ResponseSettingsPanel({
           disabled={isSending}
           className="mt-5 space-y-5 disabled:opacity-60"
         >
+          <div className="space-y-2">
+            <label htmlFor="context-strategy" className="block text-sm font-medium">Стратегия управления контекстом</label>
+            <NativeSelect id="context-strategy" value={contextStrategy} className="w-full [&_select]:h-10" onChange={(event) => onContextStrategyChange(event.target.value as ContextStrategy)}>
+              <NativeSelectOption value="summary">Суммаризация</NativeSelectOption>
+              <NativeSelectOption value="none">Без всего</NativeSelectOption>
+            </NativeSelect>
+            <p className="text-sm text-muted-foreground">Без суммаризации отправляется полная raw-история; при лимите сервера появится ошибка до запроса.</p>
+          </div>
           <div className="space-y-2">
             <label
               htmlFor="deepseek-model"

@@ -9,11 +9,26 @@ export type TokenUsage = {
   completion_tokens_details?: { reasoning_tokens?: number };
 };
 
-type StreamOptions = {
+export type StreamChatOptions = {
   signal?: AbortSignal;
   onRequest?: (requestJson: string) => void;
   onDelta?: (content: string) => void;
   onUsage?: (usage: TokenUsage) => void;
+};
+
+export type StreamChatResult = {
+  message: string;
+  finishReason: string | null;
+  usage: TokenUsage | null;
+  model: string;
+};
+
+export type ChatTransport = {
+  request: (
+    messages: IncomingMessage[],
+    settings: ResponseSettings,
+    options: StreamChatOptions,
+  ) => Promise<StreamChatResult>;
 };
 
 function takeFrames(buffer: string) {
@@ -55,13 +70,8 @@ function parseFrame(frame: string) {
 export async function streamChat(
   messages: IncomingMessage[],
   settings: ResponseSettings,
-  options: StreamOptions,
-): Promise<{
-  message: string;
-  finishReason: string | null;
-  usage: TokenUsage | null;
-  model: string;
-}> {
+  options: StreamChatOptions,
+): Promise<StreamChatResult> {
   const response = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -148,3 +158,6 @@ export async function streamChat(
   if (!message.trim()) throw new Error('Сервер вернул пустой ответ.');
   return { message, finishReason, usage, model };
 }
+
+/** Default browser transport. Kept injectable through Agent for tests and alternate clients. */
+export const httpChatTransport: ChatTransport = { request: streamChat };

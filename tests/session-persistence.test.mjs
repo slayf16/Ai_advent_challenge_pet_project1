@@ -40,9 +40,65 @@ const hookSource = (await read('../hooks/use-chat.ts'))
   .replace('@/lib/chat-request', requestUrl)
   .replace('@/lib/experts', expertsUrl)
   .replace('@/lib/chat-metrics', metricsUrl);
-const { recoverSession, useChat } = await import(moduleUrl(hookSource));
+const { recoverSession, physicalRequests, restoreStore, summaryPlan, useChat } = await import(moduleUrl(hookSource));
 const host = await import(reactUrl);
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test('recovery keeps request links, summary boundary and independent usage fields', () => {
+  const session = recoverSession({
+    id: 'chat', title: 'Чат', updatedAt: Date.now(),
+    agent: { id: 'agent', name: 'Агент', settings: { model: 'deepseek-v4-flash' } },
+    messages: [
+      { id: 'u', role: 'user', content: 'вопрос', requestIds: ['same'] },
+      { id: 'a', role: 'assistant', content: 'ответ', metrics: { requestId: 'same', model: 'deepseek-v4-flash', startedAt: 1, firstTokenAt: null, endedAt: 2, status: 'complete', usage: { completion_tokens_details: { reasoning_tokens: 4 } } } },
+    ], runs: [], requestJson: null, lastRequest: null,
+    summary: { content: 'старый контекст', coveredThroughMessageId: 'a' },
+    summaryMetrics: [{ requestId: 'same', model: 'deepseek-v4-flash', startedAt: 1, firstTokenAt: null, endedAt: 2, status: 'complete', usage: null }],
+  });
+  assert.deepEqual(session.messages[0].requestIds, ['same']);
+  assert.equal(session.summary.coveredThroughMessageId, 'a');
+  assert.equal(session.messages[1].metrics.usage.completion_tokens_details.reasoning_tokens, 4);
+  assert.equal(physicalRequests(session).length, 1, 'physical IDs are deduplicated, never inferred by position');
+});
+
+test('summary covers the entire eligible prefix and leaves exactly five raw messages', () => {
+  const messages = Array.from({ length: 20 }, (_, index) => ({
+    id: String(index), role: index % 2 ? 'assistant' : 'user', content: `m${index}`,
+    ...(index % 2 ? { metrics: { status: 'complete' } } : {}),
+  }));
+  for (const size of [5]) {
+    const plan = summaryPlan(messages.slice(0, size), null);
+    assert.equal(plan.batch, null);
+    assert.deepEqual(plan.raw.map((item) => item.id), Array.from({ length: size }, (_, i) => String(i)));
+  }
+  const plan = summaryPlan(messages, null);
+  assert.deepEqual(plan.batch.map((item) => item.id), Array.from({ length: 15 }, (_, i) => String(i)));
+  assert.deepEqual(plan.raw.map((item) => item.id), Array.from({ length: 20 }, (_, i) => String(i)));
+  const advanced = summaryPlan(messages, { content: 'summary', coveredThroughMessageId: '14' });
+  assert.deepEqual(advanced.raw.map((item) => item.id), Array.from({ length: 5 }, (_, i) => String(i + 15)));
+});
+
+test('deleting inactive, active and last chats keeps an independently restorable session', () => {
+  host.reset();
+  const first = (() => { host.begin(); return useChat(); })();
+  const original = first.activeSessionId;
+  first.newChat();
+  let chat = (() => { host.begin(); return useChat(); })();
+  const active = chat.activeSessionId;
+  assert.notEqual(active, original);
+  chat.deleteChat(original);
+  chat = (() => { host.begin(); return useChat(); })();
+  assert.equal(chat.sessions.length, 1);
+  assert.equal(chat.activeSessionId, active);
+  chat.deleteChat(active);
+  chat = (() => { host.begin(); return useChat(); })();
+  assert.equal(chat.sessions.length, 1, 'deleting last creates one empty Flash chat');
+  assert.equal(chat.messages.length, 0);
+  assert.equal(chat.settings.model, 'deepseek-v4-flash');
+  const restored = restoreStore(JSON.stringify({ sessions: chat.sessions, activeSessionId: chat.activeSessionId }));
+  assert.equal(restored.sessions.length, 1);
+  assert.equal(restored.activeSessionId, chat.activeSessionId);
+});
 
 test('first render does not read or overwrite localStorage before mount restoration', async () => {
   const writes = [];

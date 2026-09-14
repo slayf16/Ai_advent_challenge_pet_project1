@@ -44,6 +44,32 @@ test('usage without a saved price snapshot remains an unknown cost', () => {
   assert.equal(aggregate.isPartial, true);
 });
 
+test('aggregate speed uses only known completion and duration coverage', () => {
+  const aggregate = aggregateMetrics([
+    { startedAt: 0, firstTokenAt: null, endedAt: 1000, status: 'complete', usage: { prompt_tokens: 1, completion_tokens: 20, total_tokens: 21 } },
+    { startedAt: 0, firstTokenAt: null, endedAt: null, status: 'cancelled', usage: { prompt_tokens: 1, completion_tokens: 999, total_tokens: 1000 } },
+  ], 2_000, Date.now());
+  assert.equal(aggregate.averageTokensPerSecond, 20);
+  assert.equal(aggregate.speedCount, 1);
+  assert.equal(aggregate.wallTimeMs, 1000, 'unknown terminal end must not grow with current clock');
+});
+
+test('partial usage keeps independent tokens and known output cost without inventing totals', () => {
+  const snapshot = pricingSnapshotForModel('deepseek-v4-flash', 1_700_000_000_000);
+  const aggregate = aggregateMetrics([
+    { startedAt: 0, firstTokenAt: null, endedAt: 1000, status: 'complete', pricingSnapshot: snapshot, usage: { completion_tokens: 42 } },
+    { startedAt: 0, firstTokenAt: null, endedAt: 1000, status: 'complete', pricingSnapshot: snapshot, usage: { prompt_tokens: 9 } },
+  ], 1000, Date.now());
+  assert.equal(aggregate.usage.completion_tokens, 42);
+  assert.equal(aggregate.usage.prompt_tokens, 9);
+  assert.equal(aggregate.usage.total_tokens, undefined, 'components from distinct physical calls never imply a total');
+  assert.equal(aggregate.completionCount, 1);
+  assert.equal(aggregate.promptCount, 1);
+  assert.equal(aggregate.totalTokenCount, 0);
+  assert.ok(aggregate.minimumCostUsd > 0, 'known output and input parts retain their known price');
+  assert.equal(aggregate.isPartial, true);
+});
+
 test('pricing snapshot normalization rejects unsafe persisted values', () => {
   assert.equal(normalizePricingSnapshot({ model: 'not-a-model', tier: 'peak', currency: 'USD', unitTokens: 1_000_000, cacheHitInput: -50, cacheMissInput: 1, output: 1, verifiedAt: '2026-09-06', sourceUrl: 'https://example.com' }), undefined);
 });
@@ -113,7 +139,7 @@ test('missing cache counters produce an honest cost range and missing usage prod
   );
   assert.equal(fractional.exact, false);
   assert.equal(calculateCost(null, 'off-peak'), null);
-  assert.equal(calculateCost({ prompt_tokens: 10 }, 'off-peak'), null);
+  assert.ok(calculateCost({ prompt_tokens: 10 }, 'off-peak'), 'known input has a partial cost range');
 });
 
 test('speed uses full request duration while TTFT remains a separate metric', () => {

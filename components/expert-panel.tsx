@@ -5,6 +5,14 @@ import { RequestMetricsView } from '@/components/request-metrics';
 import { EXPERT_ROLES } from '@/lib/experts';
 import type { ExpertRun } from '@/hooks/use-chat';
 
+const prettyJson = (value: string) => {
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return value;
+  }
+};
+
 export function ExpertPanel({ run }: { run: ExpertRun }) {
   return (
     <section
@@ -90,7 +98,7 @@ export function ExpertPanel({ run }: { run: ExpertRun }) {
                   <details className="text-sm text-muted-foreground">
                     <summary className="cursor-pointer">JSON запроса</summary>
                     <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs">
-                      {JSON.stringify(JSON.parse(expert.requestJson), null, 2)}
+                      {prettyJson(expert.requestJson)}
                     </pre>
                   </details>
                 )}

@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useState,
   type KeyboardEvent,
   type SyntheticEvent,
 } from 'react';
@@ -18,11 +19,15 @@ import {
   Square,
   User,
   Users,
+  Trash2,
 } from 'lucide-react';
+import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
+import { Dialog, DialogContent } from '@/components/ui/dialog';
 import { ResponseSettingsPanel } from '@/components/response-settings';
 import { ExpertPanel } from '@/components/expert-panel';
 import {
@@ -54,6 +59,9 @@ declare global {
 }
 
 export default function Home() {
+  const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [comparisonOpen, setComparisonOpen] = useState(false);
+  const prettyComparisonJson = (value: string | null, fallback: string) => { try { return value ? JSON.stringify(JSON.parse(value), null, 2) : fallback; } catch { return fallback; } };
   const chat = useChat();
   const { send } = chat;
   const sendRef = useRef(send);
@@ -75,12 +83,7 @@ export default function Home() {
   const followOutput = useRef(true);
   const previousSessionId = useRef<string | null>(null);
   const invalid = settingsError(chat.settings);
-  const metrics = [
-    ...chat.messages.flatMap((message) =>
-      message.metrics ? [message.metrics] : [],
-    ),
-    ...chat.runs.flatMap((run) => run.experts.map((expert) => expert.metrics)),
-  ];
+  const metrics = chat.metrics;
 
   const scrollChat = useCallback((position: 'start' | 'end') => {
     const desktopLayout = window.matchMedia('(min-width: 1024px)').matches;
@@ -139,6 +142,12 @@ export default function Home() {
     if (!followOutput.current) return;
     scrollChat(chat.messages.length ? 'end' : 'start');
   }, [chat.messages, chat.phase, chat.runs, scrollChat]);
+  // Only a comparison created during this page lifetime opens itself.  Saved
+  // comparisons remain available through the explicit button below.
+  useEffect(() => {
+    if (chat.comparisonEvent)
+      queueMicrotask(() => setComparisonOpen(true));
+  }, [chat.comparisonEvent]);
 
   useEffect(() => {
     const context = document.modelContext;
@@ -253,6 +262,7 @@ export default function Home() {
             <Plus className="size-4" />
             <span>Новый диалог</span>
           </Button>
+          <Link href="/statistics" className="rounded-xl px-3 py-2 text-sm hover:bg-white/5">Статистика</Link>
         </header>
 
         <div className="grid flex-1 grid-cols-1 gap-6 py-6 lg:min-h-0 lg:grid-cols-[220px_minmax(0,1fr)_340px] lg:gap-6">
@@ -266,8 +276,8 @@ export default function Home() {
               </div>
               <div className="space-y-1">
                 {chat.sessions.map((session) => (
+                  <div key={session.id} className="flex items-center gap-1">
                   <button
-                    key={session.id}
                     type="button"
                     disabled={chat.isSending}
                     onClick={() => chat.setActiveSession(session.id)}
@@ -276,8 +286,18 @@ export default function Home() {
                     <span className="block truncate font-medium">{session.title}</span>
                     <span className="mt-0.5 block truncate text-xs opacity-75">{session.agent.name}</span>
                   </button>
+                  <Button type="button" variant="ghost" size="icon" disabled={chat.isSending} aria-label={`Удалить чат ${session.title}`} onClick={() => setDeleteId(session.id)}>
+                    <Trash2 className="size-4" />
+                  </Button>
+                  </div>
                 ))}
               </div>
+              <AlertDialog open={deleteId !== null} onOpenChange={(open) => !open && setDeleteId(null)}>
+                <AlertDialogContent>
+                  <AlertDialogHeader><AlertDialogTitle>Удалить чат?</AlertDialogTitle><AlertDialogDescription>Чат «{chat.sessions.find((item) => item.id === deleteId)?.title}» будет удалён из этого браузера. Снимки статистики сохранятся.</AlertDialogDescription></AlertDialogHeader>
+                  <AlertDialogFooter><AlertDialogCancel>Отмена</AlertDialogCancel><AlertDialogAction onClick={() => { if (deleteId) chat.deleteChat(deleteId); setDeleteId(null); }}>Удалить</AlertDialogAction></AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
               <p className="mt-3 px-2 text-xs leading-5 text-muted-foreground">
                 Сессии и черновики хранятся только в этом браузере.
               </p>
@@ -517,6 +537,7 @@ export default function Home() {
                     <span>{chat.error}</span>
                   </div>
                 )}
+                {chat.storageError && <div role="alert" className="mb-3 rounded-2xl border border-amber-400/35 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">{chat.storageError}</div>}
                 <div className="rounded-[1.7rem] border border-white/10 bg-card/95 p-2 shadow-[0_24px_80px_rgba(0,0,0,0.38)]">
                   <Textarea
                     value={draft}
@@ -573,6 +594,37 @@ export default function Home() {
                   Модель может ошибаться — проверяйте важную информацию.
                 </p>
             </form>
+            {chat.comparison && (
+              <Button
+                type="button"
+                variant="outline"
+                className="mb-4 self-start"
+                onClick={() => setComparisonOpen(true)}
+              >
+                Сравнить JSON
+              </Button>
+            )}
+            <Dialog open={comparisonOpen} onOpenChange={setComparisonOpen}>
+              <DialogContent className="w-[min(95vw,1200px)] max-w-none sm:max-w-none">
+                <h2 className="pr-10 font-semibold">Сравнение контекста</h2>
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <section className="min-w-0">
+                    <h3 className="mb-2 font-medium">Предыдущий фактически отправленный запрос</h3>
+                    {chat.comparison?.before?.includes('Сводка предыдущей части диалога (контекст)') && (
+                      <p className="mb-2 text-xs text-muted-foreground">Этот предыдущий запрос уже содержал сводку истории.</p>
+                    )}
+                    {!chat.comparison?.before && (
+                      <p className="mb-2 text-xs text-muted-foreground">Предпросмотр, не отправлялся.</p>
+                    )}
+                    <pre className="max-h-[60vh] overflow-auto rounded bg-black/20 p-3 text-xs leading-5">{prettyComparisonJson(chat.comparison?.before ?? null, 'Без предыдущего фактически отправленного JSON')}</pre>
+                  </section>
+                  <section className="min-w-0">
+                    <h3 className="mb-2 font-medium">Текущий фактически отправленный запрос после summary</h3>
+                    <pre className="max-h-[60vh] overflow-auto rounded bg-black/20 p-3 text-xs leading-5">{prettyComparisonJson(chat.comparison?.current ?? null, 'Нет фактически отправленного JSON')}</pre>
+                  </section>
+                </div>
+              </DialogContent>
+            </Dialog>
           </section>
           <ResponseSettingsPanel
             agentName={chat.agent.name}
@@ -592,6 +644,8 @@ export default function Home() {
                 );
             }}
             requestJson={chat.requestJson}
+            contextStrategy={chat.contextStrategy}
+            onContextStrategyChange={chat.setContextStrategy}
           />
         </div>
       </div>

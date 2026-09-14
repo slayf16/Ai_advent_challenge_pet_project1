@@ -124,8 +124,6 @@ export const normalizePricingSnapshot = (
     ...(v.legacyInferred === true ? { legacyInferred: true } : {}),
   };
 };
-const nonNegative = (v: number | undefined) =>
-  Number.isFinite(v) && v! >= 0 ? v! : 0;
 const hasUsage = (
   u: TokenUsage | null,
 ): u is TokenUsage & {
@@ -151,11 +149,12 @@ function cacheBreakdown(usage: TokenUsage) {
 }
 export type CostEstimate = {
   exact: boolean;
+  isPartial: boolean;
   minimumUsd: number;
   maximumUsd: number;
   cacheHitInputUsd: number | null;
   cacheMissInputUsd: number | null;
-  outputUsd: number;
+  outputUsd: number | null;
   tier: PricingTier;
   snapshot: PricingSnapshot;
 };
@@ -164,7 +163,7 @@ export function calculateCost(
   snapshotOrTier: PricingSnapshot | PricingTier,
   model?: ChatModel,
 ): CostEstimate | null {
-  if (!hasUsage(usage)) return null;
+  if (!usage) return null;
   const snapshot =
     typeof snapshotOrTier === 'string'
       ? (() => {
@@ -181,8 +180,13 @@ export function calculateCost(
           };
         })()
       : snapshotOrTier;
-  const outputUsd =
-    (usage.completion_tokens * snapshot.output) / snapshot.unitTokens;
+  const cacheOnly = Number.isInteger(usage.prompt_cache_hit_tokens) && usage.prompt_cache_hit_tokens! >= 0 && Number.isInteger(usage.prompt_cache_miss_tokens) && usage.prompt_cache_miss_tokens! >= 0;
+  const promptKnown = Number.isInteger(usage.prompt_tokens) && usage.prompt_tokens! >= 0;
+  const completionKnown = Number.isInteger(usage.completion_tokens) && usage.completion_tokens! >= 0;
+  if (!promptKnown && !completionKnown && !cacheOnly) return null;
+  const outputUsd = completionKnown
+    ? (usage.completion_tokens! * snapshot.output) / snapshot.unitTokens
+    : null;
   if (
     snapshot.cacheHitInput === 0 &&
     snapshot.cacheMissInput === 0 &&
@@ -195,19 +199,23 @@ export function calculateCost(
       cacheHitInputUsd: 0,
       cacheMissInputUsd: 0,
       outputUsd: 0,
+      isPartial: !hasUsage(usage),
       tier: snapshot.tier,
       snapshot,
     };
-  const cache = cacheBreakdown(usage);
+  const cache = promptKnown ? cacheBreakdown(usage) : cacheOnly ? { hit: usage.prompt_cache_hit_tokens!, miss: usage.prompt_cache_miss_tokens! } : null;
+  const minimumInput = promptKnown
+    ? (usage.prompt_tokens! * snapshot.cacheHitInput) / snapshot.unitTokens
+    : cacheOnly ? (usage.prompt_cache_hit_tokens! * snapshot.cacheHitInput + usage.prompt_cache_miss_tokens! * snapshot.cacheMissInput) / snapshot.unitTokens : 0;
+  const maximumInput = promptKnown
+    ? (usage.prompt_tokens! * snapshot.cacheMissInput) / snapshot.unitTokens
+    : cacheOnly ? minimumInput : 0;
   if (!cache)
     return {
-      exact: false,
-      minimumUsd:
-        outputUsd +
-        (usage.prompt_tokens * snapshot.cacheHitInput) / snapshot.unitTokens,
-      maximumUsd:
-        outputUsd +
-        (usage.prompt_tokens * snapshot.cacheMissInput) / snapshot.unitTokens,
+      exact: !promptKnown && !cacheOnly,
+      isPartial: !hasUsage(usage),
+      minimumUsd: (outputUsd ?? 0) + minimumInput,
+      maximumUsd: (outputUsd ?? 0) + maximumInput,
       cacheHitInputUsd: null,
       cacheMissInputUsd: null,
       outputUsd,
@@ -218,9 +226,10 @@ export function calculateCost(
       (cache.hit * snapshot.cacheHitInput) / snapshot.unitTokens,
     cacheMissInputUsd =
       (cache.miss * snapshot.cacheMissInput) / snapshot.unitTokens,
-    total = cacheHitInputUsd + cacheMissInputUsd + outputUsd;
+    total = cacheHitInputUsd + cacheMissInputUsd + (outputUsd ?? 0);
   return {
     exact: true,
+    isPartial: !hasUsage(usage),
     minimumUsd: total,
     maximumUsd: total,
     cacheHitInputUsd,
@@ -261,7 +270,7 @@ export function metricsSnapshot(
     durationMs,
     ttftMs,
     averageTokensPerSecond:
-      hasUsage(metrics.usage) && durationMs !== null && durationMs > 0
+      metrics.usage?.completion_tokens !== undefined && durationMs !== null && durationMs > 0
         ? metrics.usage.completion_tokens / (durationMs / 1000)
         : null,
     cost: pricingSnapshot
@@ -279,6 +288,11 @@ export type AggregateMetrics = {
   minimumCostUsd: number | null;
   maximumCostUsd: number | null;
   exactCost: boolean;
+  averageTokensPerSecond: number | null;
+  speedCount: number;
+  promptCount: number;
+  completionCount: number;
+  totalTokenCount: number;
 };
 export function aggregateMetrics(
   metrics: RequestMetrics[],
@@ -296,8 +310,14 @@ export function aggregateMetrics(
       minimumCostUsd: null,
       maximumCostUsd: null,
       exactCost: false,
+      averageTokensPerSecond: null,
+      speedCount: 0,
+      promptCount: 0,
+      completionCount: 0,
+      totalTokenCount: 0,
     };
-  const intervals = metrics.map((m) => {
+  const intervals = metrics.flatMap((m) => {
+    if (m.endedAt === null && m.status !== 'running') return [];
     const toEpoch = (v: number) =>
       m.startedAt > 10_000_000_000 ? v : requestEpochMs(v, performance, epoch);
     return {
@@ -307,63 +327,60 @@ export function aggregateMetrics(
       ),
     };
   });
-  const known = metrics.filter(
-    (
-      m,
-    ): m is RequestMetrics & {
-      usage: TokenUsage & {
-        prompt_tokens: number;
-        completion_tokens: number;
-        total_tokens: number;
-      };
-    } => hasUsage(m.usage),
-  );
-  const usage = known.length
-    ? known.reduce<TokenUsage>(
-        (total, item) => ({
-          prompt_tokens:
-            nonNegative(total.prompt_tokens) + item.usage.prompt_tokens,
-          completion_tokens:
-            nonNegative(total.completion_tokens) + item.usage.completion_tokens,
-          total_tokens:
-            nonNegative(total.total_tokens) + item.usage.total_tokens,
-          prompt_cache_hit_tokens:
-            nonNegative(total.prompt_cache_hit_tokens) +
-            nonNegative(item.usage.prompt_cache_hit_tokens),
-          prompt_cache_miss_tokens:
-            nonNegative(total.prompt_cache_miss_tokens) +
-            nonNegative(item.usage.prompt_cache_miss_tokens),
-          completion_tokens_details: {
-            reasoning_tokens:
-              nonNegative(total.completion_tokens_details?.reasoning_tokens) +
-              nonNegative(
-                item.usage.completion_tokens_details?.reasoning_tokens,
-              ),
-          },
-        }),
-        {},
-      )
-    : null;
-  const costs = known
+  const sum = (field: keyof TokenUsage) => metrics.reduce<number | undefined>((total, item) => {
+    const value = item.usage?.[field];
+    return typeof value === 'number' && Number.isInteger(value) && value >= 0
+      ? (total ?? 0) + value : total;
+  }, undefined);
+  const reasoning = metrics.reduce<number | undefined>((total, item) => {
+    const value = item.usage?.completion_tokens_details?.reasoning_tokens;
+    return typeof value === 'number' && Number.isInteger(value) && value >= 0
+      ? (total ?? 0) + value : total;
+  }, undefined);
+  const usage = metrics.some((item) => item.usage) ? {
+    ...(sum('prompt_tokens') !== undefined ? { prompt_tokens: sum('prompt_tokens') } : {}),
+    ...(sum('completion_tokens') !== undefined ? { completion_tokens: sum('completion_tokens') } : {}),
+    ...(sum('total_tokens') !== undefined ? { total_tokens: sum('total_tokens') } : {}),
+    ...(sum('prompt_cache_hit_tokens') !== undefined ? { prompt_cache_hit_tokens: sum('prompt_cache_hit_tokens') } : {}),
+    ...(sum('prompt_cache_miss_tokens') !== undefined ? { prompt_cache_miss_tokens: sum('prompt_cache_miss_tokens') } : {}),
+    ...(reasoning !== undefined ? { completion_tokens_details: { reasoning_tokens: reasoning } } : {}),
+  } : null;
+  const usageCount = metrics.filter((item) => item.usage !== null).length;
+  const promptCount = metrics.filter((item) => item.usage?.prompt_tokens !== undefined).length;
+  const completionCount = metrics.filter((item) => item.usage?.completion_tokens !== undefined).length;
+  const totalTokenCount = metrics.filter((item) => item.usage?.total_tokens !== undefined).length;
+  const costs = metrics
     .map((m) => metricsSnapshot(m, performance, epoch).cost)
     .filter((cost): cost is CostEstimate => cost !== null);
+  const speed = metrics
+    .map((item) => ({ item, snapshot: metricsSnapshot(item, performance, epoch) }))
+    .filter(({ item, snapshot }) =>
+      item.usage?.completion_tokens !== undefined && snapshot.durationMs !== null && snapshot.durationMs > 0,
+    );
   return {
     wallTimeMs: Math.max(
       0,
-      Math.max(...intervals.map((i) => i.end)) -
-        Math.min(...intervals.map((i) => i.start)),
+      intervals.length ? Math.max(...intervals.map((i) => i.end)) - Math.min(...intervals.map((i) => i.start)) : 0,
     ),
     usage,
-    usageCount: known.length,
+    usageCount,
     costCount: costs.length,
     totalCount: metrics.length,
-    isPartial: known.length !== metrics.length || costs.length !== known.length,
+    isPartial: usageCount !== metrics.length || costs.length !== metrics.length || costs.some((cost) => cost.isPartial),
     minimumCostUsd: costs.length
       ? costs.reduce((s, c) => s + c.minimumUsd, 0)
       : null,
     maximumCostUsd: costs.length
       ? costs.reduce((s, c) => s + c.maximumUsd, 0)
       : null,
-    exactCost: costs.length === metrics.length && costs.every((c) => c.exact),
+    exactCost: costs.length === metrics.length && costs.every((c) => c.exact && !c.isPartial),
+    averageTokensPerSecond: speed.length
+      ? speed.reduce((total, { item }) => total + item.usage!.completion_tokens!, 0) /
+        (speed.reduce((total, { snapshot }) => total + snapshot.durationMs!, 0) / 1000)
+      : null,
+    speedCount: speed.length,
+    promptCount,
+    completionCount,
+    totalTokenCount,
   };
 }

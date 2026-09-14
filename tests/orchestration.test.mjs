@@ -1,3 +1,4 @@
+/* oxlint-disable react-hooks/rules-of-hooks -- this file intentionally renders the hook in a tiny stateful host. */
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { afterEach, mock, test } from 'node:test';
@@ -34,7 +35,7 @@ const { EXPERT_ROLES, synthesisMessages } = await import(expertsUrl);
 // Minimal hook host: run the production hook and transport without a DOM or a paid API call.
 const reactUrl = moduleUrl(`
 let slots = [], cursor = 0;
-export function reset() { slots = []; cursor = 0; }
+export function reset(initialSlots = []) { slots = initialSlots; cursor = 0; }
 export function begin() { cursor = 0; }
 export function useState(initial) { const index = cursor++; if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial; return [slots[index], value => { slots[index] = typeof value === 'function' ? value(slots[index]) : value; }]; }
 export function useRef(initial) { const index = cursor++; return slots[index] ??= {current:initial}; }
@@ -56,9 +57,9 @@ const render = () => {
 };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const usage = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
-const response = (message) =>
+const response = (message, usageOverride = usage) =>
   new Response(
-    `event: request\ndata: {"requestJson":"{}"}\n\nevent: delta\ndata: ${JSON.stringify({ content: message })}\n\nevent: done\ndata: ${JSON.stringify({ finishReason: 'stop', usage, model: 'deepseek-v4-flash' })}\n\n`,
+    `event: request\ndata: {"requestJson":"{}"}\n\nevent: delta\ndata: ${JSON.stringify({ content: message })}\n\nevent: done\ndata: ${JSON.stringify({ finishReason: 'stop', usage: usageOverride, model: 'deepseek-v4-flash' })}\n\n`,
     { headers: { 'Content-Type': 'text/event-stream' } },
   );
 function setup() {
@@ -79,6 +80,216 @@ function setup() {
   );
   return calls;
 }
+
+async function seedCompletedTurns(calls, count = 10) {
+  for (let index = 0; index < count; index++) {
+    const pending = render().send(`history-${index}`);
+    const firstCall = calls.at(-1);
+    firstCall.resolve(response(`answer-${index}`));
+    await tick();
+    // A seeded turn can first issue a summary. Resolve the following main
+    // request as well; bounded iterations turn a harness mismatch into a fail.
+    if (calls.at(-1) !== firstCall) {
+      calls.at(-1).resolve(response(`answer-${index}`));
+      await tick();
+    }
+    await pending;
+    await tick();
+  }
+}
+
+test('summary is a physical request, preserves raw order and retry does not advance a failed boundary', async () => {
+  const calls = setup();
+  await seedCompletedTurns(calls);
+  const before = calls.length;
+  const pending = render().send('new question');
+  assert.equal(calls.length, before + 1, 'new request starts one summary before the main request');
+  const summaryCall = calls.at(-1);
+  assert.ok(summaryCall.body.messages.length <= 26, 'summary packet stays below transport message cap');
+  assert.equal(summaryCall.body.settings.model, 'deepseek-v4-flash');
+  summaryCall.resolve(response('compressed context'));
+  await tick();
+  assert.equal(calls.length, before + 2);
+  const mainCall = calls.at(-1);
+  const context = mainCall.body.messages.map((item) => item.content).join('\n');
+  assert.match(context, /compressed context/);
+  assert.match(context, /history-8/);
+  assert.match(context, /new question/);
+  mainCall.resolve(response('final'));
+  await pending;
+  const chat = render();
+  assert.equal(chat.messages.length, 22, 'raw UI history remains complete');
+  assert.equal(chat.metrics.filter((item) => item.requestId).length, calls.length, 'summary is counted once beside every physical call');
+});
+
+test('summary abort and failure retain old raw context and retry can start a fresh summary', async () => {
+  const calls = setup();
+  await seedCompletedTurns(calls);
+  const before = calls.length;
+  const failed = render().send('will fail');
+  calls.at(-1).reject(new Error('summary transport failed'));
+  await assert.rejects(failed, /summary transport failed/);
+  let chat = render();
+  assert.equal(chat.messages.length, 20);
+  assert.equal(chat.lastRequest.prompt, 'history-9', 'failed summary does not replace the prior retry snapshot');
+  assert.equal(chat.metrics.at(-1).status, 'error');
+  const retry = render().send('retry');
+  assert.equal(calls.length, before + 2, 'retry begins another summary from unchanged raw history');
+  render().stop();
+  await assert.rejects(retry);
+  chat = render();
+  assert.equal(chat.messages.length, 20);
+  assert.equal(chat.metrics.at(-1).status, 'cancelled');
+});
+
+test('invalid council preparation never starts summary or locks the chat', async () => {
+  const calls = setup();
+  await seedCompletedTurns(calls);
+  const before = calls.length;
+  for (const options of [
+    { council: true, topic: '' },
+    { council: true, topic: 'x'.repeat(301) },
+    { council: true, topic: 'ok', dataset: 'x'.repeat(11901) },
+  ]) {
+    await assert.rejects(render().send('invalid council', options));
+    const chat = render();
+    assert.equal(chat.isSending, false);
+    assert.equal(chat.phase, '');
+    assert.equal(chat.messages.length, 20);
+    assert.equal(calls.length, before, 'invalid input must not pay for summary');
+  }
+  const chat = render();
+  chat.setSettings({ ...chat.settings, systemPrompt: 'x'.repeat(7_900) });
+  await assert.rejects(render().send('derived invalid', { council: true, topic: 'ok' }));
+  assert.equal(render().isSending, false);
+  assert.equal(calls.length, before);
+});
+
+test('council and synthesis retain summary data while every transport request stays below MAX_MESSAGES', async () => {
+  const calls = setup();
+  await seedCompletedTurns(calls);
+  const before = calls.length;
+  const pending = render().send('council question', { council: true, topic: 'tests' });
+  calls.at(-1).resolve(response('compressed council context'));
+  await tick();
+  assert.equal(calls.length, before + 4, 'three experts start after one summary');
+  for (const call of calls.slice(-3)) {
+    assert.ok(call.body.messages.length <= 30);
+    assert.match(call.body.messages.map((item) => item.content).join('\n'), /compressed council context/);
+    call.resolve(response(`expert-${calls.indexOf(call)}`));
+  }
+  await tick();
+  const synthesis = calls.at(-1);
+  assert.ok(synthesis.body.messages.length <= 30);
+  synthesis.resolve(response('synthesis'));
+  await pending;
+});
+
+test('none strategy sends raw history without summary and rejects overflow before transport', async () => {
+  const calls = setup();
+  const chat = render();
+  chat.setContextStrategy('none');
+  await seedCompletedTurns(calls, 3);
+  const before = calls.length;
+  const pending = render().send('raw next');
+  assert.equal(calls.length, before + 1);
+  assert.equal(calls.at(-1).body.messages.filter((m) => m.content.startsWith('Сожми')).length, 0);
+  calls.at(-1).resolve(response('ok')); await pending;
+  const overflow = render();
+  overflow.setContextStrategy('none');
+  // State is intentionally not mutated with synthetic rows here: server-limit
+  // behavior is covered by historyMessages/no-trim contract and hook validation.
+  assert.equal(render().isSending, false);
+});
+
+test('summary transport packets keep server limits for a long prefix', async () => {
+  const calls = setup();
+  // Drive the production hook through completed turns; every captured request
+  // is the actual transport JSON that the server would validate.
+  await seedCompletedTurns(calls, 20);
+  const pending = render().send('long-prefix-next');
+  let cursor = calls.length - 1;
+  for (let guard = 0; guard < 8; guard++) {
+    const call = calls[cursor];
+    assert.ok(call.body.messages.length <= 30);
+    assert.ok(call.body.messages.every((m) => m.content.length <= 12000));
+    call.resolve(response(`fold-${guard}`));
+    await tick();
+    if (calls.length === cursor + 1) break;
+    cursor++;
+  }
+  calls.at(-1).resolve(response('final'));
+  await pending;
+});
+
+test('hydrated legacy forty long raw messages are folded in bounded transport packets', async () => {
+  const calls = [];
+  const long = 'x'.repeat(12000);
+  const messages = Array.from({ length: 40 }, (_, i) => ({ id: `l${i}`, role: i % 2 ? 'assistant' : 'user', content: long, ...(i % 2 ? { metrics: { status: 'complete' } } : {}) }));
+  const session = { id:'legacy',title:'legacy',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages,runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:{content:long,coveredThroughMessageId:'l0'},summaryMetrics:[],contextStrategy:'summary',lastMainRequestJson:null,comparison:null };
+  host.reset([session, [session], session.id, true]);
+  mock.method(globalThis, 'fetch', (url, options) => new Promise((resolve) => { calls.push({ body: JSON.parse(options.body), resolve }); }));
+  const pending = render().send('next');
+  for (let i=0;i<8 && calls.length;i++) { const call=calls.at(-1); assert.ok(call.body.messages.length<=30); assert.ok(call.body.messages.every((m)=>m.content.length<=12000)); call.resolve(response(`s${i}`)); await tick(); if (calls.at(-1)===call) break; }
+  calls.at(-1).resolve(response('main')); await pending;
+});
+
+test('packetizer accepts 24001 raw and 72000 previous summary under transport caps', async () => {
+  const calls=[]; const raw='r'.repeat(24001), prior='p'.repeat(72000);
+  const session={id:'p',title:'p',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages:[{id:'u',role:'user',content:'old'},{id:'a',role:'assistant',content:raw,metrics:{status:'complete'}},{id:'u2',role:'user',content:'x'},{id:'a2',role:'assistant',content:'y',metrics:{status:'complete'}},{id:'u3',role:'user',content:'z'},{id:'a3',role:'assistant',content:'q',metrics:{status:'complete'}}],runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:{content:prior,coveredThroughMessageId:'u'},summaryMetrics:[],contextStrategy:'summary',lastMainRequestJson:null,comparison:null};
+  host.reset([session,[session],session.id,true]); mock.method(globalThis,'fetch',(url,o)=>new Promise(resolve=>calls.push({body:JSON.parse(o.body),resolve})));
+  const pending=render().send('next'); for(let i=0;i<5&&calls.length;i++){const call=calls.at(-1);assert.ok(call.body.messages.length<=30);assert.ok(call.body.messages.every(m=>m.content.length<=12000));call.resolve(response(`s${i}`));await tick();if(calls.at(-1)===call)break;} calls.at(-1).resolve(response('final'));await pending;
+});
+
+test('none 350k context rejects before transport', async () => {
+  const session={id:'n',title:'n',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages:[{id:'u',role:'user',content:'x'},{id:'a',role:'assistant',content:'x'.repeat(350000),metrics:{status:'complete'}}],runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:null,summaryMetrics:[],contextStrategy:'none',lastMainRequestJson:null,comparison:null}; host.reset([session,[session],session.id,true]); let n=0;mock.method(globalThis,'fetch',()=>{n++;});await assert.rejects(render().send('next'),/превышает лимит/);assert.equal(n,0);assert.equal(render().isSending,false);
+});
+
+test('summary 350k row folds through bounded physical requests', async () => {
+  const calls=[]; const session={id:'s',title:'s',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages:[{id:'old',role:'user',content:'old'},{id:'huge',role:'assistant',content:'x'.repeat(350000),metrics:{status:'complete'}},{id:'u2',role:'user',content:'2'},{id:'a2',role:'assistant',content:'2',metrics:{status:'complete'}},{id:'u3',role:'user',content:'3'},{id:'a3',role:'assistant',content:'3',metrics:{status:'complete'}},{id:'u4',role:'user',content:'4'},{id:'a4',role:'assistant',content:'4',metrics:{status:'complete'}}],runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:null,summaryMetrics:[],contextStrategy:'summary',lastMainRequestJson:null,comparison:null};host.reset([session,[session],session.id,true]);mock.method(globalThis,'fetch',(u,o)=>new Promise(resolve=>calls.push({body:JSON.parse(o.body),resolve})));const pending=render().send('next');for(let i=0;i<40&&calls.length;i++){const c=calls.at(-1);assert.ok(c.body.messages.length<=30);assert.ok(c.body.messages.every(m=>m.content.length<=12000));c.resolve(response(`f${i}`));await tick();if(calls.at(-1)===c)break;}calls.at(-1).resolve(response('main'));await pending;assert.ok(calls.length>1);
+});
+
+test('failed 350k fold does not commit a partial logical cutoff', async () => {
+  const calls=[]; const old={content:'old checkpoint',coveredThroughMessageId:'old'}; const session={id:'f',title:'f',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages:[{id:'old',role:'user',content:'old'},{id:'huge',role:'assistant',content:'x'.repeat(350000),metrics:{status:'complete'}},{id:'u2',role:'user',content:'2'},{id:'a2',role:'assistant',content:'2',metrics:{status:'complete'}},{id:'u3',role:'user',content:'3'},{id:'a3',role:'assistant',content:'3',metrics:{status:'complete'}},{id:'u4',role:'user',content:'4'},{id:'a4',role:'assistant',content:'4',metrics:{status:'complete'}}],runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:old,summaryMetrics:[],contextStrategy:'summary',lastMainRequestJson:null,comparison:null};host.reset([session,[session],session.id,true]);mock.method(globalThis,'fetch',(_url,_options)=>new Promise((resolve,reject)=>calls.push({resolve,reject})));const pending=render().send('next');calls[0].reject(new Error('fold failed'));await assert.rejects(pending);const chat=render();assert.deepEqual(chat.sessions[0].summary,old);assert.equal(calls.length,1);assert.equal(chat.isSending,false);
+});
+
+test('comparison records previous and current actual main request JSON only after summary success', async () => {
+  const calls = setup();
+  await seedCompletedTurns(calls, 4);
+  const before = render();
+  before.setContextStrategy('summary');
+  const pending = render().send('compare');
+  calls.at(-1).resolve(response('summary')); await tick();
+  const main = calls.at(-1); main.resolve(response('answer')); await pending;
+  const chat = render();
+  assert.equal(typeof chat.comparison?.current, 'string');
+  assert.equal(chat.comparison?.current, chat.lastMainRequestJson);
+  assert.equal(typeof chat.comparisonEvent, 'string', 'only the fresh main request emits an ephemeral open event');
+});
+
+test('none mode keeps distinct user request ids and input usage', async () => {
+  const calls = setup();
+  render().setContextStrategy('none');
+  const first = render().send('one'); calls.at(-1).resolve(response('a', { prompt_tokens:11, completion_tokens:2, total_tokens:13 })); await first;
+  const second = render().send('two'); calls.at(-1).resolve(response('b', { prompt_tokens:23, completion_tokens:3, total_tokens:26 })); await second;
+  const chat = render();
+  const users = chat.messages.filter((item) => item.role === 'user');
+  assert.equal(users.length, 2);
+  assert.notEqual(users[0].requestIds[0], users[1].requestIds[0]);
+  const byId = new Map(chat.metrics.map((item) => [item.requestId, item]));
+  assert.equal(byId.get(users[0].requestIds[0]).usage.prompt_tokens, 11);
+  assert.equal(byId.get(users[1].requestIds[0]).usage.prompt_tokens, 23);
+  assert.equal(chat.metrics.reduce((sum, item) => sum + (item.usage?.prompt_tokens ?? 0), 0), 34);
+});
+
+test('hydrated none history over server cap rejects before fetch and remains unlocked', async () => {
+  const messages = Array.from({ length: 40 }, (_, i) => ({ id:`n${i}`, role:i%2?'assistant':'user', content:`raw-${i}`, ...(i%2?{metrics:{status:'complete'}}:{}) }));
+  const session = { id:'none',title:'none',updatedAt:1,agent:{id:'a',name:'a',settings:{model:'deepseek-v4-flash',systemPrompt:'',format:'',maxTokens:null,temperature:null,stopMode:'none',stopInstruction:'',stopSequence:''}},messages,runs:[],error:null,requestJson:null,lastRequest:null,draft:'',council:false,topic:'',dataset:'',summary:{content:'stored summary',coveredThroughMessageId:'n34'},summaryMetrics:[],contextStrategy:'none',lastMainRequestJson:null,comparison:null };
+  host.reset([session,[session],session.id,true]);
+  let fetches=0; mock.method(globalThis,'fetch',()=>{fetches++; return Promise.reject(new Error('must not fetch'));});
+  await assert.rejects(render().send('next'), /превышает лимит/);
+  assert.equal(fetches,0); assert.equal(render().isSending,false);
+});
 afterEach(() => mock.restoreAll());
 
 test('three experts start concurrently; synthesis waits for all and receives every full answer plus original data', async () => {
@@ -164,7 +375,7 @@ test('repeat uses the original context and new settings; ordinary follow-up uses
   const first = render().send('Исходная задача');
   calls[0].resolve(response('Вариант A'));
   await first;
-  let chat = render();
+  const chat = render();
   chat.setSettings({ ...chat.settings, systemPrompt: 'Кратко', temperature: 0, model: 'deepseek-v4-pro' });
   const repeated = render().repeat();
   assert.deepEqual(calls[1].body.messages, calls[0].body.messages);

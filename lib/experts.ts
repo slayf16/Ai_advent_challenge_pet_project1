@@ -46,7 +46,7 @@ export function historyMessages(
     }
     return parts;
   });
-  return packets.slice(-(MAX_MESSAGES - 1));
+  return packets;
 }
 
 export type ExpertAnswer = {
